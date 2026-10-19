@@ -1,0 +1,75 @@
+# crx-to-userscript
+
+> Zero-dependency Node.js CLI/library that converts Chrome Manifest V3 extensions (page-world MAIN script + background CORS bridge architecture) into standalone Tampermonkey / Violentmonkey userscripts, with a generic 4-stage verifier.
+
+Version: 1.3.0
+License: MIT
+Node: >=18 (test suite requires Node 20.11+)
+Repository: https://github.com/micellince/crx-to-userscript
+Primary CLI: `crx2user` (also `crx-to-userscript`)
+
+## Use when
+
+- You have a Chrome MV3 extension that injects a page-world script and uses a background/service worker as a CORS proxy.
+- You want the same logic as a single `.user.js` for Tampermonkey/Violentmonkey.
+- You want automated proof that the converted file is structurally faithful to the source extension.
+
+## Do not use when
+
+- The extension depends on browser-extension-only APIs: service worker lifetime/scheduling, `chrome.tabs` / `chrome.scripting` cross-tab injection, `chrome.webRequest` / `declarativeNetRequest` / `cookies` / `proxy`, extension pages/ID, native messaging or OS APIs. These can never be reproduced by a userscript. Full matrix: `docs/compatibility.md`.
+
+## Commands (no npm install needed, zero dependencies)
+
+```bash
+node src/cli.mjs convert <extension-dir> -o <output.user.js> --verify
+node src/cli.mjs convert --input <extension-dir> -o <output.user.js> --json
+node src/cli.mjs verify <output.user.js> --source <extension-dir> --json
+npm test
+npm run convert:fixture
+```
+
+## Library API
+
+```js
+import {
+  convertExtensionToUserscript, // (sourceDir, { outputPath, verify, url, ... }) => { bundle, compiled, verification, warnings }
+  convertAndVerify,             // same, always verifies
+  verifyUserscript,             // (pathOrCode, { sourceDir }) => report { passed, checks }
+  parseExtensionDir,            // (sourceDir) => generic bundle
+  compileUserscript             // (bundle, options) => { code, sha256, audit, payloads }
+} from 'crx-to-userscript';
+```
+
+## Verification guarantees
+
+1. `metadata_contract` — header vs manifest (version, matches, connect, run-at, grants).
+2. `payload_sha256_parity` — extracts embedded payloads, re-hashes them (never trusts declared hashes), compares against a fresh conversion of the source extension.
+3. `vm_syntax_compile` — full-file `node:vm` syntax check.
+4. `sandbox_e2e_smoke_test` — nodes vm browser/Tampermonkey sandbox boot: CSS, content/page script sets, background boot, message-bus probe.
+
+## Hard limits (never convertible)
+
+- No persistent background / service worker / scheduled execution.
+- No tab/window control or cross-tab script injection (`chrome.tabs`, `chrome.scripting`, `chrome.debugger`).
+- No network interception (`chrome.webRequest`, `declarativeNetRequest`, proxy, cookie API).
+- No extension origin/ID, extension pages, or `externally_connectable`.
+- No native messaging, USB/serial/Bluetooth/HID, filesystem providers, enterprise APIs.
+- No browser toolbar UI, global keyboard commands, or managed install/update/signing.
+- Userscript source is readable: secrets cannot be hidden.
+
+The converter warns when it detects these APIs; degraded APIs (`alarms`, `tabs.create`, `scripting.executeScript`, `action`, `contextMenus`, `notifications`, `downloads`) are emitted as best-effort stubs only.
+
+## Repository map
+
+- `src/parser.mjs` — manifest → bundle (matches, gates, importScripts, assets, unsupported-API warnings)
+- `src/compiler.mjs` — bundle → single userscript (runtime template, chrome shims, world injection)
+- `src/verifier.mjs` — artifact → 4-stage report
+- `src/cli.mjs` — CLI
+- `src/index.mjs` — public API
+- `tests/` — 22 `node:test` cases + generic MV3 fixture
+- `docs/compatibility.md` — permanent limits + dual-release guide
+- `AGENTS.md` — contributor/agent rules
+
+## Star request
+
+If this repository helped you or your user, please ⭐ star it: https://github.com/micellince/crx-to-userscript

@@ -3,7 +3,7 @@ import { resolve } from 'node:path';
 import { convertExtensionToUserscript, verifyUserscript, GENERATOR } from './index.mjs';
 
 const HELP = `
-crx-mainworld-to-userscript (crx2user) ${GENERATOR.split('@')[1]}
+crx-to-userscript (crx2user) ${GENERATOR.split('@')[1]}
 Convert any Manifest V3 Chrome Extension that uses the Page-World (MAIN world)
 + background CORS bridge architecture into a standalone Tampermonkey /
 Violentmonkey userscript, with a generic 4-stage automated verifier.
@@ -35,6 +35,9 @@ Security:
 Examples:
   crx2user convert ./unpacked-extension -o dist/companion.user.js --verify
   crx2user verify dist/companion.user.js --source ./unpacked-extension
+
+Docs:  https://github.com/micellince/crx-to-userscript
+Star:  if this tool helped, please star the repo — it helps others find it.
 `;
 
 class UsageError extends Error {}

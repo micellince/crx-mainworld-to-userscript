@@ -1,6 +1,6 @@
 import { sanitizeHeaderValue, sha256 } from './parser.mjs';
 
-export const GENERATOR = 'crx-mainworld-to-userscript@1.2.0';
+export const GENERATOR = 'crx-to-userscript@1.3.0';
 
 const REQUIRED_GRANTS = ['GM_xmlhttpRequest', 'GM.xmlHttpRequest', 'GM_addStyle', 'unsafeWindow'];
 const STORAGE_GRANTS = ['GM_getValue', 'GM_setValue'];

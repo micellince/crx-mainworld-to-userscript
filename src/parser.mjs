@@ -6,6 +6,81 @@ const MAX_EMBEDDED_ASSET_BYTES = 4 * 1024 * 1024;
 const RUN_AT_ORDER = ['document-start', 'document-end', 'document-idle'];
 const REAL_ROOT_CACHE = new Map();
 
+
+const PERMANENT_BROWSER_APIS = {
+  tabs: 'opening and controlling browser tabs is a browser-extension privilege with no userscript equivalent',
+  windows: 'window management is not available to userscripts',
+  scripting: 'injecting scripts into other tabs is a browser-extension privilege',
+  webRequest: 'network interception/modification is not available to userscripts',
+  declarativeNetRequest: 'declarative network rules are not available to userscripts',
+  cookies: 'the cookies API is not available to userscripts',
+  debugger: 'the debugger API is extension-only',
+  identity: 'OAuth/web-auth identity flows are extension-only',
+  sidePanel: 'the side panel UI is extension-only',
+  offscreen: 'offscreen documents are extension-only',
+  proxy: 'proxy control is extension-only',
+  management: 'extension management is extension-only',
+  permissions: 'runtime permission requests are extension-only',
+  privacy: 'privacy settings control is extension-only',
+  contentSettings: 'content settings control is extension-only',
+  nativeMessaging: 'native messaging is extension-only',
+  connectNative: 'native messaging is extension-only',
+  devtools: 'devtools integration is extension-only',
+  tabGroups: 'tab groups are not available to userscripts',
+  webNavigation: 'the webNavigation API is extension-only',
+  sessions: 'the sessions API is extension-only',
+  history: 'browser history access is extension-only',
+  bookmarks: 'browser bookmarks access is extension-only',
+  downloads: 'download-item control is extension-only (a plain download may be possible)',
+  topSites: 'top sites access is extension-only',
+  readingList: 'the reading list API is extension-only',
+  fontSettings: 'font settings are extension-only',
+  tts: 'text-to-speech is extension-only',
+  usb: 'USB access is extension-only',
+  serial: 'serial access is extension-only',
+  bluetooth: 'Bluetooth access is extension-only',
+  hid: 'HID access is extension-only',
+  sockets: 'raw sockets are extension-only',
+  fileSystemProvider: 'filesystem providers are extension-only',
+  printing: 'printing APIs are extension-only',
+  enterprise: 'enterprise APIs are extension-only',
+  vpnProvider: 'VPN APIs are extension-only',
+  wallpaper: 'wallpaper control is extension-only',
+  audio: 'audio device control is extension-only',
+  system: 'system.* APIs are extension-only'
+};
+
+const DEGRADED_BROWSER_APIS = {
+  alarms: 'scheduled callbacks only run while a matching page is open (no service worker)',
+  action: 'no toolbar button/popup; use an injected UI or the userscript menu instead',
+  contextMenus: 'no native context menu integration; use the userscript manager menu',
+  browserAction: 'no toolbar button/popup; use an injected UI or the userscript menu instead',
+  notifications: 'depends on GM_notification support in the userscript manager',
+  commands: 'no global keyboard shortcut API; page-level key listeners only'
+};
+
+function detectBrowserApiUsage(sources) {
+  const used = new Set();
+  const degraded = new Set();
+  const patterns = [
+    /chrome\s*\.\s*([a-zA-Z][a-zA-Z0-9_]*)/g,
+    /chrome\s*\[\s*['"`]([a-zA-Z][a-zA-Z0-9_]*)['"`]\s*\]/g
+  ];
+  for (const source of sources) {
+    const code = String(source || '');
+    for (const pattern of patterns) {
+      let match;
+      while ((match = pattern.exec(code))) {
+        const api = match[1];
+        if (Object.prototype.hasOwnProperty.call(PERMANENT_BROWSER_APIS, api)) used.add(api);
+        else if (Object.prototype.hasOwnProperty.call(DEGRADED_BROWSER_APIS, api)) degraded.add(api);
+      }
+    }
+    if (/chrome\s*\.\s*runtime\s*\.\s*(connectNative|sendNativeMessage)\b/.test(code)) used.add('nativeMessaging');
+  }
+  return { unsupported: [...used].sort(), degraded: [...degraded].sort() };
+}
+
 const MIME_TYPES = {
   '.png': 'image/png',
   '.jpg': 'image/jpeg',
@@ -792,6 +867,48 @@ export async function parseExtensionDir(extDir) {
   const connectDomains = extractConnectDomains(manifest);
   const noframes = contentScripts.length > 0 && contentScripts.every(entry => entry.allFrames !== true);
 
+  // Detect browser-extension-only APIs so conversion output and documentation
+  // are explicit about features a userscript can never reproduce.
+  const scannedSources = [];
+  if (background) {
+    scannedSources.push(background.code);
+    for (const imported of background.imports) scannedSources.push(imported.code);
+  }
+  for (const entry of contentScripts) {
+    if (entry.world === 'MAIN') continue;
+    for (const asset of entry.js) scannedSources.push(asset.code);
+  }
+  const browserApis = detectBrowserApiUsage(scannedSources);
+  const manifestPermissions = [
+    ...(Array.isArray(manifest.permissions) ? manifest.permissions : []),
+    ...(Array.isArray(manifest.optional_permissions) ? manifest.optional_permissions : [])
+  ];
+  for (const permission of manifestPermissions) {
+    if (typeof permission === 'string' && Object.prototype.hasOwnProperty.call(PERMANENT_BROWSER_APIS, permission)) {
+      if (!browserApis.unsupported.includes(permission)) browserApis.unsupported.push(permission);
+    }
+    if (typeof permission === 'string' && Object.prototype.hasOwnProperty.call(DEGRADED_BROWSER_APIS, permission)) {
+      if (!browserApis.degraded.includes(permission)) browserApis.degraded.push(permission);
+    }
+  }
+  browserApis.unsupported.sort();
+  browserApis.degraded.sort();
+  for (const api of browserApis.unsupported) {
+    warnings.push(
+      `Extension uses chrome.${api}: ${PERMANENT_BROWSER_APIS[api]}. Features depending on it cannot be converted 1:1 to a userscript.`
+    );
+  }
+  for (const api of browserApis.degraded) {
+    warnings.push(
+      `Extension uses chrome.${api}: ${DEGRADED_BROWSER_APIS[api]}. It is converted as a best-effort stub.`
+    );
+  }
+  if (manifest.externally_connectable) {
+    warnings.push(
+      'Manifest declares externally_connectable: userscripts have no extension ID, so websites cannot handshake with them via chrome.runtime messaging. A DOM/postMessage handshake is required instead.'
+    );
+  }
+
   return {
     root,
     manifest,
@@ -814,6 +931,7 @@ export async function parseExtensionDir(extDir) {
     binaryAssets,
     webAccessibleResources: warEntries,
     usesStorage,
+    browserApis,
     warnings
   };
 }

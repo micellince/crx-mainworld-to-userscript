@@ -428,3 +428,27 @@ test('manifest metadata cannot break out of or inject userscript header tags', a
     await rm(extensionDir, { recursive: true, force: true });
   }
 });
+
+test('browser APIs that userscripts can never reproduce are reported as warnings', async () => {
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'Privileged API Fixture',
+      version: '1.0.0',
+      permissions: ['webRequest'],
+      background: { service_worker: 'background.js' },
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['content.js'] }]
+    }),
+    'background.js': "'use strict';\nchrome.tabs.create({ url: 'https://example.com' });\nchrome.alarms.create('tick', { periodInMinutes: 1 });\n",
+    'content.js': "'use strict';\n"
+  });
+  try {
+    const bundle = await parseExtensionDir(extensionDir);
+    assert.deepEqual(bundle.browserApis.unsupported, ['tabs', 'webRequest']);
+    assert.deepEqual(bundle.browserApis.degraded, ['alarms']);
+    assert.ok(bundle.warnings.some(warning => warning.includes('chrome.tabs') && warning.includes('cannot be converted 1:1')));
+    assert.ok(bundle.warnings.some(warning => warning.includes('chrome.alarms')));
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
+  }
+});
