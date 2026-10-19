@@ -12,6 +12,16 @@ window.addEventListener('message', event => {
   });
 });
 
+// Generic loader: request page-world script + stylesheet via getURL().
+const loader = document.createElement('script');
+loader.src = chrome.runtime.getURL('page/main.js');
+(document.head || document.documentElement).appendChild(loader);
+
+const styleLink = document.createElement('link');
+styleLink.rel = 'stylesheet';
+styleLink.href = chrome.runtime.getURL('page/main.css');
+(document.head || document.documentElement).appendChild(styleLink);
+
 // Generic chrome.* surface exercised at boot: getManifest / getURL / storage.
 document.documentElement.dataset.genericBridgeVersion = chrome.runtime.getManifest().version;
 const logoUrl = chrome.runtime.getURL('assets/logo.png');

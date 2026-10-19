@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
-import { mkdtemp, mkdir, writeFile, rm } from 'node:fs/promises';
+import { mkdtemp, mkdir, writeFile, rm, symlink } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import {
@@ -14,7 +14,8 @@ import {
   matchesAnyPattern,
   patternToSampleUrl,
   normalizeVersion,
-  sanitizeHeaderValue
+  sanitizeHeaderValue,
+  parseEmbeddedPayloads
 } from '../src/index.mjs';
 
 const PROJECT_ROOT = resolve(import.meta.dirname, '..');
@@ -90,22 +91,26 @@ test('parser understands recursive importScripts, multiple content script groups
   assert.equal(bundle.version, '2.4.1');
   assert.equal(bundle.runAt, 'document-start');
   assert.equal(bundle.noframes, false);
+  assert.equal(bundle.usesStorage, true);
   assert.deepEqual(bundle.matches, ['https://app.example.com/*', 'https://docs.example.com/*']);
   assert.deepEqual(bundle.connectDomains, ['api.example.com', 'data.example.net', 'localhost']);
   assert.deepEqual(bundle.background.imports.map(asset => asset.path), ['lib/nested/token.js', 'lib/helpers.js']);
   assert.equal(bundle.background.hasDynamicImports, false);
   assert.equal(bundle.contentScripts.length, 3);
+  assert.equal(bundle.contentScripts[1].runAt, 'document-start');
+  assert.deepEqual(bundle.contentScripts[1].gate.excludeMatches, ['https://docs.example.com/private/*']);
   assert.equal(bundle.contentScripts[2].world, 'MAIN');
   assert.deepEqual(bundle.pageScripts.map(asset => asset.path), ['page/main.js', 'page/main-world.js']);
   assert.deepEqual(bundle.cssAssets.map(asset => asset.path), ['content/theme.css', 'page/main.css']);
   assert.equal(bundle.pageScripts[1].runAt, 'document-idle');
+  assert.equal(bundle.pageScripts[0].allFrames, false);
+  assert.equal(bundle.pageScripts[1].allFrames, true);
   assert.equal(bundle.cssAssets[0].runAt, 'document-idle');
-  assert.equal(bundle.contentScripts[1].runAt, 'document-start');
   assert.deepEqual(bundle.binaryAssets.map(asset => asset.path), ['assets/logo.png']);
   assert.ok(bundle.iconDataUri.startsWith('data:image/png;base64,'));
 });
 
-test('generic fixture converts and verifies on both matched origins with per-entry gating', async () => {
+test('generic fixture converts and verifies with per-entry gating and exclusions', async () => {
   const bundle = await parseExtensionDir(GENERIC_EXT_DIR);
   const compiled = compileUserscript(bundle);
 
@@ -116,6 +121,10 @@ test('generic fixture converts and verifies on both matched origins with per-ent
   assert.ok(compiled.code.includes('// @connect      localhost'));
   assert.ok(compiled.code.includes('data:image/png;base64,'));
   assert.ok(!compiled.code.includes('// @noframes'));
+  assert.ok(compiled.code.includes('// @grant        GM_getValue'));
+  assert.ok(compiled.code.includes('// @grant        GM_setValue'));
+  const payloads = parseEmbeddedPayloads(compiled.code);
+  assert.ok(payloads, 'embedded payload block must be extractable');
   assert.ok(compiled.code.includes('"imports":["lib/nested/token.js","lib/helpers.js"]'));
 
   const appReport = await verifyUserscript(compiled.code, { sourceBundle: bundle, url: 'https://app.example.com/dashboard' });
@@ -132,6 +141,13 @@ test('generic fixture converts and verifies on both matched origins with per-ent
   assert.match(docsSmoke.details, /contentScripts=1\/1/);
   assert.match(docsSmoke.details, /pageScripts=0\/0/);
   assert.match(docsSmoke.details, /css=0\/0/);
+
+  const excludedReport = await verifyUserscript(compiled.code, { sourceBundle: bundle, url: 'https://docs.example.com/private/secret' });
+  assert.equal(excludedReport.passed, true, JSON.stringify(excludedReport.checks, null, 2));
+  const excludedSmoke = excludedReport.checks.find(check => check.name === 'sandbox_e2e_smoke_test');
+  assert.match(excludedSmoke.details, /contentScripts=0\/0/);
+  assert.match(excludedSmoke.details, /pageScripts=0\/0/);
+  assert.match(excludedSmoke.details, /css=0\/0/);
 });
 
 test('convertExtensionToUserscript writes an artifact and runs verification end to end', async () => {
@@ -146,6 +162,163 @@ test('convertExtensionToUserscript writes an artifact and runs verification end 
     assert.equal(written, result.compiled.code);
   } finally {
     await rm(outputDir, { recursive: true, force: true });
+  }
+});
+
+test('tampering with an embedded payload is detected by recomputed hashes', async () => {
+  const bundle = await parseExtensionDir(GENERIC_EXT_DIR);
+  const compiled = compileUserscript(bundle);
+  const tampered = compiled.code.replace('fixture-token', 'evil-token');
+  assert.notEqual(tampered, compiled.code);
+  const tamperedPayloads = parseEmbeddedPayloads(tampered);
+  assert.ok(tamperedPayloads.backgroundSource.includes('evil-token'));
+
+  const report = await verifyUserscript(tampered, {
+    sourceBundle: bundle,
+    url: 'https://app.example.com/dashboard'
+  });
+  assert.equal(report.passed, false);
+  const parity = report.checks.find(check => check.name === 'payload_sha256_parity');
+  assert.equal(parity.passed, false);
+  assert.match(parity.details, /backgroundSource|hash mismatch/);
+});
+
+test('symlinks escaping the extension root are rejected', async t => {
+  if (process.platform === 'win32') {
+    t.skip('symlink creation requires elevated privileges on Windows');
+    return;
+  }
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'Symlink Fixture',
+      version: '1.0.0',
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['content.js'] }]
+    }),
+    'content.js': "'use strict';\n"
+  });
+  const outsideDir = await mkdtemp(join(tmpdir(), 'crx2user-outside-'));
+  const secretPath = join(outsideDir, 'secret.js');
+  await writeFile(secretPath, "console.log('secret');\n");
+  await symlink(secretPath, join(extensionDir, 'evil.js'));
+  const manifestPath = join(extensionDir, 'manifest.json');
+  await writeFile(manifestPath, JSON.stringify({
+    manifest_version: 3,
+    name: 'Symlink Fixture',
+    version: '1.0.0',
+    content_scripts: [{ matches: ['https://example.com/*'], js: ['evil.js'] }]
+  }));
+  try {
+    await assert.rejects(() => parseExtensionDir(extensionDir), /symlink/);
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
+    await rm(outsideDir, { recursive: true, force: true });
+  }
+});
+
+test('content script files in one group share top-level globals', async () => {
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'Shared Globals Fixture',
+      version: '1.0.0',
+      background: { service_worker: 'background.js' },
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['a.js', 'b.js'] }]
+    }),
+    'background.js': "'use strict';\nchrome.runtime.onMessage.addListener(() => false);\n",
+    'a.js': "'use strict';\nvar SHARED_VALUE = 'shared';\n",
+    'b.js': "'use strict';\nif (SHARED_VALUE !== 'shared') throw new Error('content script globals are not shared');\n"
+  });
+  try {
+    const report = await convertExtensionToUserscript(extensionDir, { verify: true });
+    assert.equal(report.verification.passed, true, JSON.stringify(report.verification.checks, null, 2));
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
+  }
+});
+
+test('importScripts keeps worker execution order when calls appear after statements', async () => {
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'Import Order Fixture',
+      version: '1.0.0',
+      background: { service_worker: 'background.js' },
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['content.js'] }]
+    }),
+    'background.js': "'use strict';\nvar READY_STATE = 'ready';\nimportScripts('dep.js');\nchrome.runtime.onMessage.addListener((message, sender, sendResponse) => {\n  sendResponse({ ok: READY_STATE === 'ready' && DEP_STATE === 'ready-dep' });\n  return false;\n});\n",
+    'dep.js': "'use strict';\nvar DEP_STATE = READY_STATE + '-dep';\n",
+    'content.js': "'use strict';\n"
+  });
+  try {
+    const bundle = await parseExtensionDir(extensionDir);
+    const compiled = compileUserscript(bundle);
+    const source = compiled.payloads.backgroundSource;
+    const readyIndex = source.indexOf("var READY_STATE");
+    const depIndex = source.indexOf("var DEP_STATE");
+    const listenerIndex = source.indexOf('chrome.runtime.onMessage.addListener');
+    assert.ok(readyIndex >= 0 && depIndex > readyIndex, 'dependency must be inlined after the preceding statement');
+    assert.ok(listenerIndex > depIndex, 'statements after importScripts must run after the dependency');
+    const report = await verifyUserscript(compiled.code, { sourceBundle: bundle, url: 'https://example.com/' });
+    assert.equal(report.passed, true, JSON.stringify(report.checks, null, 2));
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
+  }
+});
+
+test('a throwing page-world script fails verification', async () => {
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'Broken Page Script Fixture',
+      version: '1.0.0',
+      background: { service_worker: 'background.js' },
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['content.js'] }],
+      web_accessible_resources: [{ resources: ['page/broken.js'], matches: ['https://example.com/*'] }]
+    }),
+    'background.js': "'use strict';\nchrome.runtime.onMessage.addListener(() => false);\n",
+    'content.js': "'use strict';\nchrome.runtime.getURL('page/broken.js');\n",
+    'page/broken.js': "throw new Error('page script boom');\n"
+  });
+  try {
+    const bundle = await parseExtensionDir(extensionDir);
+    const compiled = compileUserscript(bundle);
+    const report = await verifyUserscript(compiled.code, { sourceBundle: bundle, url: 'https://example.com/' });
+    assert.equal(report.passed, false);
+    const smoke = report.checks.find(check => check.name === 'sandbox_e2e_smoke_test');
+    assert.equal(smoke.passed, false);
+    assert.match(smoke.details, /pageScriptErrors=/);
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
+  }
+});
+
+test('storage grants are only requested when the extension uses chrome.storage', async () => {
+  const withStorage = await parseExtensionDir(GENERIC_EXT_DIR);
+  const withStorageCode = compileUserscript(withStorage).code;
+  assert.ok(withStorageCode.includes('// @grant        GM_getValue'));
+  assert.ok(withStorageCode.includes('// @grant        GM_setValue'));
+  assert.ok(withStorageCode.includes('storageNamespace'));
+
+  const extensionDir = await createTempExtension({
+    'manifest.json': JSON.stringify({
+      manifest_version: 3,
+      name: 'No Storage Fixture',
+      version: '1.0.0',
+      background: { service_worker: 'background.js' },
+      content_scripts: [{ matches: ['https://example.com/*'], js: ['content.js'] }]
+    }),
+    'background.js': "'use strict';\nchrome.runtime.onMessage.addListener(() => false);\n",
+    'content.js': "'use strict';\n"
+  });
+  try {
+    const withoutStorage = await parseExtensionDir(extensionDir);
+    assert.equal(withoutStorage.usesStorage, false);
+    const code = compileUserscript(withoutStorage).code;
+    assert.ok(!code.includes('// @grant        GM_getValue'));
+    assert.ok(!code.includes('// @grant        GM_setValue'));
+  } finally {
+    await rm(extensionDir, { recursive: true, force: true });
   }
 });
 

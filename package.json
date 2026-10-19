@@ -1,6 +1,6 @@
 {
   "name": "crx-mainworld-to-userscript",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "Zero-dependency CLI & library that converts Manifest V3 Chrome Extensions (Page-World / MAIN world + Background CORS Bridge) into standalone Tampermonkey/Violentmonkey userscripts, with a generic 4-stage sandbox verifier.",
   "license": "MIT",
   "type": "module",

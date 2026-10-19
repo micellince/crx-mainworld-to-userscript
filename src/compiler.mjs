@@ -1,17 +1,32 @@
 import { sanitizeHeaderValue, sha256 } from './parser.mjs';
 
-export const GENERATOR = 'crx-mainworld-to-userscript@1.1.0';
+export const GENERATOR = 'crx-mainworld-to-userscript@1.2.0';
 
 const REQUIRED_GRANTS = ['GM_xmlhttpRequest', 'GM.xmlHttpRequest', 'GM_addStyle', 'unsafeWindow'];
+const STORAGE_GRANTS = ['GM_getValue', 'GM_setValue'];
 
 /**
- * Serializes a value into a JavaScript string literal that is safe to embed in
- * a generated script (line/paragraph separators are escaped explicitly).
+ * Serializes a value into a JavaScript string literal safe to embed in the
+ * generated userscript (line/paragraph separators are escaped explicitly).
  */
 function jsLiteral(value) {
   return JSON.stringify(value)
     .replace(/\u2028/g, '\\u2028')
     .replace(/\u2029/g, '\\u2029');
+}
+
+/**
+ * Stable per-extension namespace used for storage keys so two converted
+ * userscripts (or the same script on different origins) never collide.
+ */
+function buildStorageNamespace(bundle) {
+  const slug = String(bundle.name || 'userscript')
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, '-')
+    .replace(/^-+|-+$/g, '')
+    .slice(0, 24) || 'userscript';
+  const fingerprint = sha256(`${bundle.name}|${bundle.homepageUrl || ''}|${(bundle.matches || [])[0] || ''}`).slice(0, 12);
+  return `${slug}-${fingerprint}`;
 }
 
 /**
@@ -67,6 +82,9 @@ export function buildUserscriptHeader(bundle, options = {}) {
   }
   lines.push(`// @run-at       ${runAt}`);
   for (const grant of REQUIRED_GRANTS) lines.push(`// @grant        ${grant}`);
+  if (bundle.usesStorage) {
+    for (const grant of STORAGE_GRANTS) lines.push(`// @grant        ${grant}`);
+  }
   if (bundle.noframes && options.noframes !== false) lines.push('// @noframes');
   if (bundle.iconDataUri && options.includeIcon !== false) {
     lines.push(`// @icon         ${bundle.iconDataUri}`);
@@ -76,10 +94,9 @@ export function buildUserscriptHeader(bundle, options = {}) {
 }
 
 /**
- * Builds the extension -> virtual/data URL mapping used by the runtime
- * chrome.runtime.getURL() shim. CSS and JS assets receive virtual URLs because
- * the userscript injects them itself; other assets become data URLs so they can
- * still be used by content-script UI code.
+ * Extension -> virtual/data URL mapping used by the chrome.runtime.getURL()
+ * shim. CSS and JS get virtual URLs (the userscript injects them itself);
+ * other assets become data URLs so content-script UI code can still use them.
  */
 function buildUrlMap(bundle) {
   const urlMap = {};
@@ -115,28 +132,74 @@ function buildUrlMap(bundle) {
   return urlMap;
 }
 
-function collectStaticImportScriptNames(bundle) {
-  const names = new Set();
-  const scan = source => {
-    const callPattern = /importScripts\s*\(([^)]*)\)/g;
-    let call;
-    while ((call = callPattern.exec(String(source || '')))) {
-      const literalPattern = /(['"`])((?:\\.|(?!\1)[^\\])*)\1/g;
-      let literal;
-      while ((literal = literalPattern.exec(call[1]))) names.add(literal[2]);
-    }
-  };
-  if (bundle.background) {
-    scan(bundle.background.code);
-    for (const imported of bundle.background.imports || []) scan(imported.code);
-  }
-  return [...names];
+function looksLikeStatementPosition(source, start, end) {
+  const before = source.slice(Math.max(0, start - 160), start).replace(/\s+$/, '');
+  const after = source.slice(end, end + 80).replace(/^\s+/, '');
+  const beforeChar = before ? before[before.length - 1] : '';
+  const afterChar = after ? after[0] : '';
+  const beforeOk = beforeChar === '' || beforeChar === ';' || beforeChar === '{' || beforeChar === '}';
+  if (!beforeOk) return false;
+  if (afterChar === '') return true;
+  if (/[;}\)\]]/.test(afterChar)) return true;
+  if (/[A-Za-z0-9_$"'`(]/.test(afterChar)) return true;
+  return false;
 }
 
 /**
- * Runtime template. This function is never executed in Node.js: it is
- * serialized with Function#toString and embedded into the generated userscript
- * after the @@TOKEN@@ placeholders are substituted.
+ * Inlines statically analysable importScripts() calls at their original call
+ * sites, preserving worker execution order. Calls that cannot be inlined at
+ * their call site are prepended as a best-effort fallback.
+ */
+function buildBackgroundSource(bundle) {
+  const background = bundle.background;
+  if (!background) return '';
+
+  const lookup = new Map();
+  for (const imported of background.imports || []) {
+    lookup.set(`${imported.declaredIn}\u0000${imported.specifier}`, imported);
+  }
+  const inlined = new Set();
+
+  const inlineFile = (relativePath, source) => {
+    const callPattern = /importScripts\s*\(\s*(['"])((?:\\.|(?!\1)[^\\])*)\1\s*\)\s*;?/g;
+    let output = '';
+    let cursor = 0;
+    let call;
+    while ((call = callPattern.exec(source))) {
+      const specifier = call[2];
+      const dependency = lookup.get(`${relativePath}\u0000${specifier}`);
+      output += source.slice(cursor, call.index);
+      if (dependency && looksLikeStatementPosition(source, call.index, callPattern.lastIndex)) {
+        if (inlined.has(dependency.path)) {
+          output += `\n/* importScripts(${JSON.stringify(specifier)}) already inlined */\n`;
+        } else {
+          inlined.add(dependency.path);
+          output += `\n${inlineFile(dependency.path, dependency.code)}\n`;
+        }
+      } else {
+        output += call[0];
+      }
+      cursor = callPattern.lastIndex;
+    }
+    output += source.slice(cursor);
+    return output;
+  };
+
+  let transformed = inlineFile(background.path, background.code);
+
+  const fallback = [];
+  for (const imported of background.imports || []) {
+    if (inlined.has(imported.path)) continue;
+    inlined.add(imported.path);
+    fallback.push(`\n/* fallback inline: ${imported.path} */\n${inlineFile(imported.path, imported.code)}`);
+  }
+  if (fallback.length > 0) transformed = `${fallback.join('\n;\n')}\n;\n${transformed}`;
+  return transformed;
+}
+
+/**
+ * Runtime template. Never executed in Node.js: serialized via Function#toString
+ * and embedded after @@TOKEN@@ substitution.
  */
 function crx2userRuntime() {
   'use strict';
@@ -146,12 +209,13 @@ function crx2userRuntime() {
   var AUDIT = JSON.parse("@@AUDIT@@");
   var MANIFEST = JSON.parse("@@MANIFEST@@");
   var URL_MAP = JSON.parse("@@URL_MAP@@");
-  var CSS_ASSETS = JSON.parse("@@CSS_ASSETS@@");
-  var CONTENT_SCRIPTS = JSON.parse("@@CONTENT_SCRIPTS@@");
-  var PAGE_SCRIPTS = JSON.parse("@@PAGE_SCRIPTS@@");
-  var BACKGROUND_IMPORTS = JSON.parse("@@BACKGROUND_IMPORTS@@");
-  var BACKGROUND_CODE = "@@BACKGROUND_CODE@@";
-  var INLINED_IMPORT_NAMES = JSON.parse("@@INLINED_IMPORT_NAMES@@");
+  var PAYLOADS = JSON.parse("@@PAYLOADS@@");
+
+  var BACKGROUND_SOURCE = PAYLOADS.backgroundSource || '';
+  var INLINED_IMPORT_NAMES = PAYLOADS.importNames || [];
+  var CSS_ASSETS = PAYLOADS.cssAssets || [];
+  var CONTENT_SCRIPTS = PAYLOADS.contentScripts || [];
+  var PAGE_SCRIPTS = PAYLOADS.pageScripts || [];
 
   var pageWin = (typeof unsafeWindow !== 'undefined' && unsafeWindow) ? unsafeWindow : window;
   var pageDoc = (pageWin && pageWin.document) ? pageWin.document : document;
@@ -190,8 +254,19 @@ function crx2userRuntime() {
     }
   } catch (error) {}
 
+  var IS_TOP_FRAME = true;
+  try {
+    IS_TOP_FRAME = pageWin.top === pageWin.self || pageWin.frameElement === null || pageWin.frameElement === undefined;
+  } catch (error) {
+    IS_TOP_FRAME = false;
+  }
+
+  function allowedByFrames(allFrames) {
+    return IS_TOP_FRAME || Boolean(allFrames);
+  }
+
   // -----------------------------------------------------------------------
-  // Chrome match-pattern gating (content script / web_accessible_resources)
+  // Chrome match-pattern / glob gating helpers
   // -----------------------------------------------------------------------
   function escapeRegExp(value) {
     return String(value).replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
@@ -237,10 +312,46 @@ function crx2userRuntime() {
     return globToRegExp(parsed.path || '/*').test(url.pathname || '/');
   }
 
-  function hrefMatches(patterns) {
-    if (!patterns || patterns.length === 0) return true;
-    for (var index = 0; index < patterns.length; index += 1) {
-      if (matchesPattern(HREF, patterns[index])) return true;
+  function gateAllows(gate) {
+    if (!gate) return true;
+    var index;
+    if (gate.matches && gate.matches.length > 0) {
+      var matchOk = false;
+      for (index = 0; index < gate.matches.length; index += 1) {
+        if (matchesPattern(HREF, gate.matches[index])) {
+          matchOk = true;
+          break;
+        }
+      }
+      if (!matchOk) return false;
+    }
+    if (gate.includeGlobs && gate.includeGlobs.length > 0) {
+      var globOk = false;
+      for (index = 0; index < gate.includeGlobs.length; index += 1) {
+        if (globToRegExp(gate.includeGlobs[index]).test(HREF)) {
+          globOk = true;
+          break;
+        }
+      }
+      if (!globOk) return false;
+    }
+    if (gate.excludeMatches) {
+      for (index = 0; index < gate.excludeMatches.length; index += 1) {
+        if (matchesPattern(HREF, gate.excludeMatches[index])) return false;
+      }
+    }
+    if (gate.excludeGlobs) {
+      for (index = 0; index < gate.excludeGlobs.length; index += 1) {
+        if (globToRegExp(gate.excludeGlobs[index]).test(HREF)) return false;
+      }
+    }
+    return true;
+  }
+
+  function gatesAllow(gates) {
+    if (!gates || gates.length === 0) return true;
+    for (var index = 0; index < gates.length; index += 1) {
+      if (gateAllows(gates[index])) return true;
     }
     return false;
   }
@@ -283,24 +394,49 @@ function crx2userRuntime() {
   }
 
   // -----------------------------------------------------------------------
-  // chrome.storage.local / sync / session shim (localStorage backed)
+  // chrome.storage shim. Uses GM storage when granted (isolated from the
+  // page); session storage is always in-memory. localStorage is only a
+  // namespaced fallback when GM storage is unavailable.
   // -----------------------------------------------------------------------
   function createStorageArea(areaName, onChangedEvent) {
-    var storageKey = 'crx2user:storage:' + areaName;
+    var storageKey = 'crx2user:storage:' + METADATA.storageNamespace + ':' + areaName;
     var memory = {};
 
+    function clone(value) {
+      return JSON.parse(JSON.stringify(value));
+    }
+
+    function gmStorageAvailable() {
+      return typeof GM_getValue === 'function' && typeof GM_setValue === 'function';
+    }
+
     function readAll() {
+      if (areaName === 'session') return clone(memory);
+      try {
+        if (gmStorageAvailable()) {
+          var stored = GM_getValue(storageKey, null);
+          if (stored !== null && stored !== undefined) return typeof stored === 'string' ? JSON.parse(stored) : stored;
+          return {};
+        }
+      } catch (error) {}
       try {
         if (typeof localStorage !== 'undefined' && localStorage) {
           var raw = localStorage.getItem(storageKey);
           if (raw) return JSON.parse(raw) || {};
         }
       } catch (error) {}
-      return JSON.parse(JSON.stringify(memory));
+      return clone(memory);
     }
 
     function writeAll(value) {
-      memory = value;
+      memory = clone(value);
+      if (areaName === 'session') return;
+      try {
+        if (gmStorageAvailable()) {
+          GM_setValue(storageKey, value);
+          return;
+        }
+      } catch (error) {}
       try {
         if (typeof localStorage !== 'undefined' && localStorage) localStorage.setItem(storageKey, JSON.stringify(value));
       } catch (error) {}
@@ -396,6 +532,7 @@ function crx2userRuntime() {
   var connectListeners = [];
   var runtimeOnInstalled = createEvent();
   var runtimeOnStartup = createEvent();
+  var runtimeOnSuspend = createEvent();
   var RUNTIME_ID = 'crx2user@' + VERSION;
 
   var runtime = {
@@ -431,6 +568,11 @@ function crx2userRuntime() {
     },
     onInstalled: runtimeOnInstalled,
     onStartup: runtimeOnStartup,
+    onSuspend: runtimeOnSuspend,
+    getPlatformInfo: function (callback) {
+      return callbackOrPromise({ os: 'mac', arch: 'x86-64', nacl_arch: 'x86-64' }, callback);
+    },
+    reload: function () {},
     sendMessage: function (first, second, third) {
       var message = first;
       var callback = second;
@@ -450,9 +592,10 @@ function crx2userRuntime() {
       function finish(response) {
         if (finished) return;
         finished = true;
-        runtime.lastError = null;
+        var error = runtime.lastError;
         if (typeof callback === 'function') callback(response);
         if (resolvePromise) resolvePromise(response);
+        runtime.lastError = null;
       }
       function sendResponse(response) {
         if (responded) return;
@@ -536,6 +679,186 @@ function crx2userRuntime() {
     }
   };
 
+  // -----------------------------------------------------------------------
+  // Additional chrome.* stubs for common MV3 background APIs. They never
+  // throw at boot; calls that cannot be emulated in a userscript reject
+  // with a descriptive error instead of crashing the worker.
+  // -----------------------------------------------------------------------
+  var actionOnClicked = createEvent();
+  var contextMenusOnClicked = createEvent();
+  var notificationsOnClicked = createEvent();
+  var alarmEvent = createEvent();
+  var alarmTimers = {};
+  var alarmRecords = {};
+  var nextTabId = 1;
+
+  function alarmDelayMillis(info) {
+    var when = Number(info && info.when);
+    if (when > 0) return Math.max(0, when - Date.now());
+    var delay = Number(info && info.delayInMinutes);
+    if (delay > 0) return delay * 60000;
+    var period = Number(info && info.periodInMinutes);
+    if (period > 0) return period * 60000;
+    return 60000;
+  }
+
+  function clearAlarmTimer(name) {
+    if (alarmTimers[name]) {
+      clearTimeout(alarmTimers[name]);
+      delete alarmTimers[name];
+    }
+  }
+
+  function scheduleAlarm(name, info) {
+    clearAlarmTimer(name);
+    var delay = alarmDelayMillis(info);
+    var period = Number(info && info.periodInMinutes) || 0;
+    alarmRecords[name] = { name: name, scheduledTime: Date.now() + delay, periodInMinutes: period || undefined };
+    function fire() {
+      var record = alarmRecords[name];
+      if (!record) return;
+      alarmEvent.emit([{ name: name, scheduledTime: Date.now() }]);
+      if (period > 0) {
+        record.scheduledTime = Date.now() + period * 60000;
+        alarmTimers[name] = setTimeout(fire, period * 60000);
+      } else {
+        delete alarmRecords[name];
+        delete alarmTimers[name];
+      }
+    }
+    alarmTimers[name] = setTimeout(fire, delay);
+  }
+
+  var chromeAlarms = {
+    create: function (nameOrInfo, maybeInfo) {
+      var name = typeof nameOrInfo === 'string' ? nameOrInfo : '';
+      var info = typeof nameOrInfo === 'string' ? (maybeInfo || {}) : (nameOrInfo || {});
+      scheduleAlarm(name, info);
+      return callbackOrPromise(undefined);
+    },
+    clear: function (name, callback) {
+      var key = String(name);
+      var existed = Boolean(alarmRecords[key]);
+      clearAlarmTimer(key);
+      delete alarmRecords[key];
+      return callbackOrPromise(existed, callback);
+    },
+    clearAll: function (callback) {
+      for (var key in alarmTimers) {
+        if (Object.prototype.hasOwnProperty.call(alarmTimers, key)) clearTimeout(alarmTimers[key]);
+      }
+      alarmTimers = {};
+      alarmRecords = {};
+      return callbackOrPromise(true, callback);
+    },
+    get: function (name, callback) {
+      var record = alarmRecords[String(name)];
+      if (!record) return callbackOrPromise(undefined, callback);
+      return callbackOrPromise({
+        name: record.name,
+        scheduledTime: record.scheduledTime,
+        periodInMinutes: record.periodInMinutes
+      }, callback);
+    },
+    getAll: function (callback) {
+      var list = [];
+      for (var key in alarmRecords) {
+        if (!Object.prototype.hasOwnProperty.call(alarmRecords, key)) continue;
+        var record = alarmRecords[key];
+        list.push({ name: record.name, scheduledTime: record.scheduledTime, periodInMinutes: record.periodInMinutes });
+      }
+      return callbackOrPromise(list, callback);
+    },
+    onAlarm: alarmEvent
+  };
+
+  var chromeTabs = {
+    create: function (properties, callback) {
+      var props = properties || {};
+      var tab = {
+        id: nextTabId,
+        url: String(props.url || 'about:blank'),
+        active: props.active !== false,
+        status: 'complete',
+        windowId: 1
+      };
+      nextTabId += 1;
+      try {
+        if (pageWin && typeof pageWin.open === 'function' && tab.url !== 'about:blank') pageWin.open(tab.url, '_blank');
+      } catch (error) {}
+      return callbackOrPromise(tab, callback);
+    },
+    get: function (tabId, callback) {
+      return callbackOrPromise({ id: tabId, url: HREF, active: true, status: 'complete', windowId: 1 }, callback);
+    },
+    query: function (queryInfo, callback) {
+      return callbackOrPromise([{ id: 1, url: HREF, active: true, status: 'complete', windowId: 1 }], callback);
+    },
+    update: function (tabId, properties, callback) {
+      return callbackOrPromise({
+        id: tabId,
+        url: (properties && properties.url) || HREF,
+        active: true,
+        status: 'complete',
+        windowId: 1
+      }, callback);
+    },
+    remove: function (tabIds, callback) {
+      return callbackOrPromise(undefined, callback);
+    },
+    sendMessage: function () {
+      return Promise.reject(new Error('chrome.tabs.sendMessage is not supported in converted userscripts'));
+    }
+  };
+
+  var chromeScripting = {
+    executeScript: function () {
+      return Promise.reject(new Error('chrome.scripting.executeScript is not supported in converted userscripts'));
+    },
+    insertCSS: function () {
+      return Promise.reject(new Error('chrome.scripting.insertCSS is not supported in converted userscripts'));
+    }
+  };
+
+  function noopCallback(value) {
+    return function (callback) {
+      return callbackOrPromise(value, callback);
+    };
+  }
+
+  var chromeAction = {
+    onClicked: actionOnClicked,
+    setBadgeText: noopCallback(undefined),
+    setBadgeBackgroundColor: noopCallback(undefined),
+    setTitle: noopCallback(undefined),
+    setIcon: noopCallback(undefined),
+    setPopup: noopCallback(undefined),
+    getPopup: noopCallback(''),
+    getTitle: noopCallback(''),
+    getBadgeText: noopCallback('')
+  };
+
+  var chromeNotifications = {
+    create: function (id, options, callback) {
+      if (typeof id === 'object' && id !== null) {
+        callback = options;
+        id = (id && id.id) || 'notification';
+      }
+      return callbackOrPromise(String(id || 'notification'), callback);
+    },
+    clear: noopCallback(true),
+    update: noopCallback(true),
+    onClicked: notificationsOnClicked
+  };
+
+  var chromeContextMenus = {
+    create: noopCallback(undefined),
+    remove: noopCallback(undefined),
+    removeAll: noopCallback(undefined),
+    update: noopCallback(undefined),
+    onClicked: contextMenusOnClicked
+  };
+
   var chromeShim = {
     runtime: runtime,
     storage: {
@@ -548,6 +871,12 @@ function crx2userRuntime() {
         hasListener: storageOnChanged.hasListener
       }
     },
+    alarms: chromeAlarms,
+    tabs: chromeTabs,
+    scripting: chromeScripting,
+    action: chromeAction,
+    notifications: chromeNotifications,
+    contextMenus: chromeContextMenus,
     i18n: {
       getMessage: function (key) {
         return String(key);
@@ -758,14 +1087,9 @@ function crx2userRuntime() {
     }
   }
 
-  if (BACKGROUND_CODE || BACKGROUND_IMPORTS.length > 0) {
+  if (BACKGROUND_SOURCE) {
     try {
-      var backgroundSource = BACKGROUND_IMPORTS.map(function (asset) {
-        return asset.code;
-      }).join('\n;\n');
-      if (backgroundSource) backgroundSource += '\n;\n';
-      backgroundSource += BACKGROUND_CODE;
-      var runBackground = new Function('chrome', 'fetch', 'self', 'importScripts', 'globalThis', backgroundSource);
+      var runBackground = new Function('chrome', 'fetch', 'self', 'importScripts', 'globalThis', BACKGROUND_SOURCE);
       runBackground(chromeShim, gmFetch, createWorkerSelf(), importScriptsShim, globalProxy);
       stats.backgroundStarted = true;
     } catch (error) {
@@ -835,7 +1159,8 @@ function crx2userRuntime() {
 
   for (var cssIndex = 0; cssIndex < CSS_ASSETS.length; cssIndex += 1) {
     (function (asset) {
-      if (!hrefMatches(asset.matches)) return;
+      if (!allowedByFrames(asset.allFrames)) return;
+      if (!gatesAllow(asset.gates)) return;
       whenDocumentReady(asset.runAt, function () {
         injectCssAsset(asset);
       });
@@ -846,22 +1171,29 @@ function crx2userRuntime() {
   // 3. Run the extension's own content scripts (the generic messaging bridge)
   // -----------------------------------------------------------------------
   function runContentScriptEntry(entry) {
+    var sources = [];
     for (var fileIndex = 0; fileIndex < entry.js.length; fileIndex += 1) {
-      var contentAsset = entry.js[fileIndex];
-      stats.contentScripts.push(contentAsset.path);
-      try {
-        var runContentScript = new Function('chrome', 'fetch', 'self', 'globalThis', contentAsset.code);
-        runContentScript(chromeShim, gmFetch, pageWin, globalProxy);
-      } catch (error) {
-        recordError('contentScript:' + contentAsset.path, error);
-      }
+      stats.contentScripts.push(entry.js[fileIndex].path);
+      sources.push(entry.js[fileIndex].code);
+    }
+    if (sources.length === 0) return;
+    try {
+      // One Function body per entry: files of the same content script group
+      // share top-level globals, matching Chrome's isolated-world semantics.
+      var runContentScript = new Function('chrome', 'fetch', 'self', 'globalThis', sources.join('\n;\n'));
+      runContentScript(chromeShim, gmFetch, pageWin, globalProxy);
+    } catch (error) {
+      recordError('contentScript:' + entry.js.map(function (asset) {
+        return asset.path;
+      }).join('+'), error);
     }
   }
 
   for (var scriptIndex = 0; scriptIndex < CONTENT_SCRIPTS.length; scriptIndex += 1) {
     (function (entry) {
       if (entry.world === 'MAIN') return;
-      if (!hrefMatches(entry.matches)) return;
+      if (!allowedByFrames(entry.allFrames)) return;
+      if (!gatesAllow(entry.gates)) return;
       whenDocumentReady(entry.runAt, function () {
         runContentScriptEntry(entry);
       });
@@ -919,7 +1251,8 @@ function crx2userRuntime() {
 
   for (var pageIndex = 0; pageIndex < PAGE_SCRIPTS.length; pageIndex += 1) {
     (function (asset) {
-      if (!hrefMatches(asset.matches)) return;
+      if (!allowedByFrames(asset.allFrames)) return;
+      if (!gatesAllow(asset.gates)) return;
       whenDocumentReady(asset.runAt, function () {
         runPageScript(asset);
       });
@@ -954,15 +1287,16 @@ export function compileUserscript(bundle, options = {}) {
 
   const background = bundle.background || null;
   const backgroundImports = (background && background.imports) || [];
-  const inlinedImportNames = collectStaticImportScriptNames(bundle);
+  const backgroundSource = buildBackgroundSource(bundle);
 
   const isolatedContentScripts = (bundle.contentScripts || [])
     .filter(entry => entry.world !== 'MAIN')
     .map(entry => ({
       index: entry.index,
-      matches: entry.matches,
+      gates: [entry.gate],
       runAt: entry.runAt,
       world: entry.world,
+      allFrames: entry.allFrames,
       js: entry.js.map(asset => ({ path: asset.path, code: asset.code, sha256: asset.sha256 }))
     }));
 
@@ -970,17 +1304,34 @@ export function compileUserscript(bundle, options = {}) {
     path: asset.path,
     code: asset.code,
     sha256: asset.sha256,
-    matches: asset.matches,
-    runAt: asset.runAt || null
+    gates: asset.gates,
+    runAt: asset.runAt,
+    allFrames: asset.allFrames
   }));
 
   const cssAssets = (bundle.cssAssets || []).map(asset => ({
     path: asset.path,
     content: asset.content,
     sha256: asset.sha256,
-    matches: asset.matches,
-    runAt: asset.runAt || null
+    gates: asset.gates,
+    runAt: asset.runAt,
+    allFrames: asset.allFrames
   }));
+
+  const payloads = {
+    background: background ? background.code : '',
+    backgroundSource,
+    backgroundImports: backgroundImports.map(asset => ({
+      path: asset.path,
+      code: asset.code,
+      declaredIn: asset.declaredIn,
+      specifier: asset.specifier
+    })),
+    importNames: [...new Set(backgroundImports.map(asset => asset.specifier))],
+    contentScripts: isolatedContentScripts,
+    pageScripts,
+    cssAssets
+  };
 
   const contentScriptHashes = {};
   for (const entry of bundle.contentScripts || []) {
@@ -998,11 +1349,13 @@ export function compileUserscript(bundle, options = {}) {
     connectDomains: bundle.connectDomains,
     runAt: bundle.runAt,
     noframes: Boolean(bundle.noframes),
+    usesStorage: Boolean(bundle.usesStorage),
     contentScripts: (bundle.contentScripts || []).map(entry => ({
       index: entry.index,
       matches: entry.matches,
       runAt: entry.runAt,
       world: entry.world,
+      allFrames: entry.allFrames,
       js: entry.js.map(asset => asset.path),
       css: entry.css.map(asset => asset.path)
     })),
@@ -1015,6 +1368,7 @@ export function compileUserscript(bundle, options = {}) {
       : null,
     hashes: {
       background: background ? background.sha256 : null,
+      backgroundSource: backgroundSource ? sha256(backgroundSource) : null,
       backgroundImports: Object.fromEntries(backgroundImports.map(asset => [asset.path, asset.sha256])),
       cssAssets: Object.fromEntries((bundle.cssAssets || []).map(asset => [asset.path, asset.sha256])),
       pageScripts: Object.fromEntries((bundle.pageScripts || []).map(asset => [asset.path, asset.sha256])),
@@ -1022,27 +1376,26 @@ export function compileUserscript(bundle, options = {}) {
     }
   };
 
+  const metadataForRuntime = {
+    generator: GENERATOR,
+    version: bundle.version,
+    name: bundle.name,
+    matches: bundle.matches,
+    runAt: bundle.runAt,
+    noframes: Boolean(bundle.noframes),
+    usesStorage: Boolean(bundle.usesStorage),
+    storageNamespace: buildStorageNamespace(bundle)
+  };
+
   const urlMap = buildUrlMap(bundle);
 
   const replacements = {
     VERSION: jsLiteral(bundle.version),
-    METADATA: jsLiteral(jsLiteral({
-      generator: GENERATOR,
-      version: bundle.version,
-      name: bundle.name,
-      matches: bundle.matches,
-      runAt: bundle.runAt,
-      noframes: Boolean(bundle.noframes)
-    })),
+    METADATA: jsLiteral(jsLiteral(metadataForRuntime)),
     AUDIT: jsLiteral(jsLiteral(auditMetadata)),
     MANIFEST: jsLiteral(jsLiteral(bundle.manifest)),
     URL_MAP: jsLiteral(jsLiteral(urlMap)),
-    CSS_ASSETS: jsLiteral(jsLiteral(cssAssets)),
-    CONTENT_SCRIPTS: jsLiteral(jsLiteral(isolatedContentScripts)),
-    PAGE_SCRIPTS: jsLiteral(jsLiteral(pageScripts)),
-    BACKGROUND_IMPORTS: jsLiteral(jsLiteral(backgroundImports.map(asset => ({ path: asset.path, code: asset.code })))),
-    BACKGROUND_CODE: jsLiteral(background ? background.code : ''),
-    INLINED_IMPORT_NAMES: jsLiteral(jsLiteral(inlinedImportNames))
+    PAYLOADS: jsLiteral(JSON.stringify(payloads))
   };
 
   const runtimeTemplate = crx2userRuntime.toString();
@@ -1059,6 +1412,7 @@ export function compileUserscript(bundle, options = {}) {
   return {
     code: fullCode,
     sha256: sha256(fullCode),
-    audit: auditMetadata
+    audit: auditMetadata,
+    payloads
   };
 }

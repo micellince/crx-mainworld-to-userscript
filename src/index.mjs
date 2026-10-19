@@ -6,16 +6,20 @@ import {
   sha256,
   matchesPattern,
   matchesAnyPattern,
+  gateMatches,
+  gatesMatch,
   patternToSampleUrl,
   normalizeUserscriptMatch,
   normalizeVersion,
-  sanitizeHeaderValue
+  sanitizeHeaderValue,
+  mimeTypeForPath
 } from './parser.mjs';
 import { compileUserscript, buildUserscriptHeader, GENERATOR } from './compiler.mjs';
 import {
   verifyUserscript,
   parseUserscriptHeader,
-  parseEmbeddedAudit
+  parseEmbeddedAudit,
+  parseEmbeddedPayloads
 } from './verifier.mjs';
 
 export {
@@ -24,16 +28,20 @@ export {
   sha256,
   matchesPattern,
   matchesAnyPattern,
+  gateMatches,
+  gatesMatch,
   patternToSampleUrl,
   normalizeUserscriptMatch,
   normalizeVersion,
   sanitizeHeaderValue,
+  mimeTypeForPath,
   compileUserscript,
   buildUserscriptHeader,
   GENERATOR,
   verifyUserscript,
   parseUserscriptHeader,
-  parseEmbeddedAudit
+  parseEmbeddedAudit,
+  parseEmbeddedPayloads
 };
 
 /**

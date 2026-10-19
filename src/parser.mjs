@@ -1,15 +1,10 @@
-import { readFile, stat, readdir } from 'node:fs/promises';
+import { readFile, stat, readdir, realpath, lstat } from 'node:fs/promises';
 import { resolve, join, posix, sep } from 'node:path';
 import { createHash } from 'node:crypto';
 
 const MAX_EMBEDDED_ASSET_BYTES = 4 * 1024 * 1024;
 const RUN_AT_ORDER = ['document-start', 'document-end', 'document-idle'];
-
-function earlierRunAt(left, right) {
-  if (left === null || left === undefined) return right === undefined ? null : right;
-  if (right === null || right === undefined) return left;
-  return RUN_AT_ORDER.indexOf(left) <= RUN_AT_ORDER.indexOf(right) ? left : right;
-}
+const REAL_ROOT_CACHE = new Map();
 
 const MIME_TYPES = {
   '.png': 'image/png',
@@ -46,9 +41,7 @@ export function mimeTypeForPath(filePath) {
 }
 
 /**
- * Normalizes a credential-free, Tampermonkey-compatible version string.
- * Chrome extension versions are dot-separated integers; userscript managers
- * reject arbitrary suffixes, so fall back to a safe numeric version.
+ * Normalizes a userscript-compatible version string.
  */
 export function normalizeVersion(rawVersion) {
   const raw = String(rawVersion == null ? '' : rawVersion).trim();
@@ -90,7 +83,6 @@ function parseMatchPattern(pattern) {
 
 /**
  * Chrome match-pattern matcher (content_scripts / web_accessible_resources).
- * Supports <all_urls>, "*" scheme, "*" host and "*" path wildcards.
  */
 export function matchesPattern(href, pattern) {
   const parsed = parseMatchPattern(pattern);
@@ -125,8 +117,7 @@ export function matchesPattern(href, pattern) {
 }
 
 /**
- * Returns true when the URL matches any pattern. A null/empty pattern list
- * means "no restriction" (i.e. every page the userscript runs on).
+ * Returns true when the URL matches any pattern. Empty list = no restriction.
  */
 export function matchesAnyPattern(href, patterns) {
   if (!patterns || patterns.length === 0) return true;
@@ -134,8 +125,7 @@ export function matchesAnyPattern(href, patterns) {
 }
 
 /**
- * Builds a concrete sample URL that satisfies a Chrome match pattern. Used by
- * the verifier to emulate the page an extension's content scripts target.
+ * Builds a concrete sample URL that satisfies a Chrome match pattern.
  */
 export function patternToSampleUrl(pattern) {
   if (!pattern) return null;
@@ -154,7 +144,6 @@ export function patternToSampleUrl(pattern) {
 
 /**
  * Normalizes a Chrome match pattern into a userscript @match pattern.
- * Returns null for patterns a userscript manager cannot express natively.
  */
 export function normalizeUserscriptMatch(pattern, warnings = null) {
   if (typeof pattern !== 'string') return null;
@@ -173,9 +162,72 @@ export function normalizeUserscriptMatch(pattern, warnings = null) {
   return trimmed;
 }
 
+function normalizeGlobList(rawList) {
+  const globs = [];
+  for (const raw of Array.isArray(rawList) ? rawList : []) {
+    if (typeof raw !== 'string' || !raw.trim()) continue;
+    globs.push(raw.trim());
+  }
+  return globs;
+}
+
+/**
+ * Builds a gate object matching Chrome's content_scripts filtering semantics:
+ * matches AND include_globs, minus exclude_matches / exclude_globs.
+ */
+function makeGate({ matches = [], includeGlobs = [], excludeMatches = [], excludeGlobs = [] } = {}) {
+  return {
+    matches: [...matches],
+    includeGlobs: [...includeGlobs],
+    excludeMatches: [...excludeMatches],
+    excludeGlobs: [...excludeGlobs]
+  };
+}
+
+/**
+ * Returns true when a Chrome URL gate allows the given href.
+ */
+export function gateMatches(href, gate) {
+  if (!gate) return true;
+  const value = String(href || '');
+  if (gate.matches && gate.matches.length > 0 && !gate.matches.some(pattern => matchesPattern(value, pattern))) {
+    return false;
+  }
+  if (gate.includeGlobs && gate.includeGlobs.length > 0 && !gate.includeGlobs.some(glob => globToRegExp(glob).test(value))) {
+    return false;
+  }
+  if (gate.excludeMatches && gate.excludeMatches.some(pattern => matchesPattern(value, pattern))) {
+    return false;
+  }
+  if (gate.excludeGlobs && gate.excludeGlobs.some(glob => globToRegExp(glob).test(value))) {
+    return false;
+  }
+  return true;
+}
+
+/**
+ * OR semantics for asset-level gates. An empty list means "no restriction".
+ */
+export function gatesMatch(href, gates) {
+  if (!gates || gates.length === 0) return true;
+  return gates.some(gate => gateMatches(href, gate));
+}
+
+function mergeGateLists(left, right) {
+  const merged = [...left];
+  const seen = new Set(merged.map(gate => JSON.stringify(gate)));
+  for (const gate of right) {
+    const key = JSON.stringify(gate);
+    if (!seen.has(key)) {
+      seen.add(key);
+      merged.push(gate);
+    }
+  }
+  return merged;
+}
+
 /**
  * Extracts hostnames for @connect from host permission patterns.
- * Accepts both a raw pattern array (backwards compatible) and a manifest.
  */
 export function extractConnectDomains(hostPermissions = []) {
   const patterns = Array.isArray(hostPermissions)
@@ -217,20 +269,55 @@ function safeResolve(root, relativePath) {
   return absolute;
 }
 
+async function realRootOf(root) {
+  if (!REAL_ROOT_CACHE.has(root)) REAL_ROOT_CACHE.set(root, await realpath(root));
+  return REAL_ROOT_CACHE.get(root);
+}
+
+/**
+ * Rejects files that resolve (through symlinks) outside the extension root,
+ * so a malicious unpacked extension cannot embed arbitrary local files.
+ */
+async function assertRealInside(root, absolutePath, relativePath) {
+  const realRoot = await realRootOf(root);
+  let realTarget;
+  try {
+    realTarget = await realpath(absolutePath);
+  } catch (error) {
+    throw new Error(`Cannot resolve file: ${relativePath} (${error.code || error.message})`);
+  }
+  if (realTarget !== realRoot && !realTarget.startsWith(realRoot + sep)) {
+    throw new Error(`Refusing to read a symlink that escapes the extension root: ${relativePath}`);
+  }
+  return realTarget;
+}
+
 async function loadTextAsset(root, relativePath, label) {
   if (typeof relativePath !== 'string' || !relativePath.trim()) {
     throw new Error(`${label} contains an invalid file reference: ${JSON.stringify(relativePath)}`);
   }
+  let absolutePath;
+  try {
+    absolutePath = safeResolve(root, relativePath);
+  } catch (error) {
+    throw new Error(`${label}: ${error.message}`);
+  }
+  let realPath;
+  try {
+    realPath = await assertRealInside(root, absolutePath, relativePath);
+  } catch (error) {
+    throw new Error(`${label}: ${error.message}`);
+  }
   let code;
   try {
-    code = await readFile(safeResolve(root, relativePath), 'utf8');
+    code = await readFile(realPath, 'utf8');
   } catch (error) {
     throw new Error(`${label} file not found: ${relativePath} (${error.code || error.message})`);
   }
   return { path: relativePath, code, sha256: sha256(code) };
 }
 
-async function expandResourcePattern(root, resourcePattern) {
+async function expandResourcePattern(root, resourcePattern, warnings) {
   const pattern = String(resourcePattern || '').trim();
   if (!pattern) return [];
   if (pattern.startsWith('/') || pattern.split('/').includes('..')) {
@@ -246,14 +333,29 @@ async function expandResourcePattern(root, resourcePattern) {
     const isLast = index === parts.length - 1;
     if (part.includes('*')) {
       const matcher = globToRegExp(part);
+      const dirAbsolute = currentDir ? safeResolve(root, currentDir) : root;
+      let dirInfo;
+      try {
+        dirInfo = await lstat(dirAbsolute);
+      } catch {
+        return;
+      }
+      if (dirInfo.isSymbolicLink()) {
+        warnings.push(`Skipping symlinked directory while expanding web_accessible_resources: ${currentDir || '.'}`);
+        return;
+      }
       let entries;
       try {
-        entries = await readdir(join(root, currentDir), { withFileTypes: true });
+        entries = await readdir(dirAbsolute, { withFileTypes: true });
       } catch {
         return;
       }
       for (const entry of entries) {
         if (!matcher.test(entry.name)) continue;
+        if (entry.isSymbolicLink()) {
+          warnings.push(`Skipping symlink in web_accessible_resources: ${currentDir ? `${currentDir}/` : ''}${entry.name}`);
+          continue;
+        }
         const relative = currentDir ? `${currentDir}/${entry.name}` : entry.name;
         if (isLast) {
           if (entry.isFile() && !seen.has(relative)) {
@@ -269,7 +371,11 @@ async function expandResourcePattern(root, resourcePattern) {
     const relative = currentDir ? `${currentDir}/${part}` : part;
     if (isLast) {
       try {
-        const info = await stat(join(root, relative));
+        const info = await lstat(safeResolve(root, relative));
+        if (info.isSymbolicLink()) {
+          warnings.push(`Skipping symlink in web_accessible_resources: ${relative}`);
+          return;
+        }
         if (info.isFile() && !seen.has(relative)) {
           seen.add(relative);
           results.push(relative);
@@ -286,13 +392,10 @@ async function expandResourcePattern(root, resourcePattern) {
   return results;
 }
 
-function mergeGates(current, incoming) {
-  if (current === null || incoming === null) return null;
-  if (current === undefined) return incoming;
-  if (incoming === undefined) return current;
-  const merged = [...current];
-  for (const item of incoming) if (!merged.includes(item)) merged.push(item);
-  return merged;
+function mergeRunAt(left, right) {
+  if (left === null || left === undefined) return right === undefined ? null : right;
+  if (right === null || right === undefined) return left;
+  return RUN_AT_ORDER.indexOf(left) <= RUN_AT_ORDER.indexOf(right) ? left : right;
 }
 
 async function collectBackgroundImports(root, entryRelativePath, warnings) {
@@ -349,7 +452,7 @@ async function collectBackgroundImports(root, entryRelativePath, warnings) {
           warnings.push(error.message);
           continue;
         }
-        imports.push(importedAsset);
+        imports.push({ ...importedAsset, declaredIn: relativePath, specifier });
       }
     }
   }
@@ -383,23 +486,23 @@ function toDataUri(mimeType, buffer) {
   return `data:${mimeType};base64,${buffer.toString('base64')}`;
 }
 
+function codeUsesChromeStorage(code) {
+  return /chrome\s*(?:\.\s*storage|\[\s*['"`]storage['"`]\s*\])/.test(String(code || ''));
+}
+
 /**
- * Parses an unpacked Chrome Manifest V3 extension directory into a generic,
- * structured bundle that is ready for userscript compilation and verification.
- *
- * Generic MV3 surface covered:
- *  - background.service_worker, including recursive static importScripts()
- *  - multiple content_scripts entries (different matches, run_at, world: MAIN)
- *  - content script CSS, web_accessible_resources CSS/JS/other assets
- *  - icons, host_permissions -> @connect, multiple match patterns
+ * Parses an unpacked Chrome Manifest V3 extension directory into a generic
+ * bundle ready for userscript compilation and verification.
  */
 export async function parseExtensionDir(extDir) {
   const root = resolve(extDir);
+  await realRootOf(root);
   let manifestRaw;
   try {
-    manifestRaw = await readFile(join(root, 'manifest.json'), 'utf8');
+    const manifestPath = await assertRealInside(root, join(root, 'manifest.json'), 'manifest.json');
+    manifestRaw = await readFile(manifestPath, 'utf8');
   } catch (error) {
-    throw new Error(`Cannot read manifest.json in ${root} (${error.code || error.message})`);
+    throw new Error(`Cannot read manifest.json in ${root}: ${error.message}`);
   }
 
   let manifest;
@@ -420,8 +523,7 @@ export async function parseExtensionDir(extDir) {
   }
 
   // ---------------------------------------------------------------------
-  // content_scripts: each entry keeps its own matches, run_at and world so
-  // the compiled userscript can gate every script to the right pages.
+  // content_scripts: matches, include/exclude globs, run_at, world, frames
   // ---------------------------------------------------------------------
   const contentScriptDefinitions = Array.isArray(manifest.content_scripts) ? manifest.content_scripts : [];
   const contentScripts = [];
@@ -439,6 +541,13 @@ export async function parseExtensionDir(extDir) {
       warnings.push(`content_scripts[${index}] has no usable match patterns and is ignored.`);
       continue;
     }
+    const excludeMatches = [];
+    for (const rawMatch of Array.isArray(definition.exclude_matches) ? definition.exclude_matches : []) {
+      const normalized = normalizeUserscriptMatch(rawMatch, warnings);
+      if (normalized && !excludeMatches.includes(normalized)) excludeMatches.push(normalized);
+    }
+    const includeGlobs = normalizeGlobList(definition.include_globs);
+    const excludeGlobs = normalizeGlobList(definition.exclude_globs);
 
     const world = String(definition.world || 'ISOLATED').toUpperCase() === 'MAIN' ? 'MAIN' : 'ISOLATED';
     const rawRunAt = String(definition.run_at || 'document_idle').replace(/_/g, '-');
@@ -460,6 +569,7 @@ export async function parseExtensionDir(extDir) {
     contentScripts.push({
       index,
       matches,
+      gate: makeGate({ matches, includeGlobs, excludeMatches, excludeGlobs }),
       runAt: entryRunAt,
       world,
       allFrames: definition.all_frames === true,
@@ -473,6 +583,7 @@ export async function parseExtensionDir(extDir) {
   // background service worker + recursive static importScripts()
   // ---------------------------------------------------------------------
   let background = null;
+  let usesStorage = false;
   const backgroundDefinition = manifest.background;
   if (backgroundDefinition && backgroundDefinition.service_worker) {
     if (String(backgroundDefinition.type || '') === 'module') {
@@ -497,6 +608,8 @@ export async function parseExtensionDir(extDir) {
       hasDynamicImports: collected.dynamicCalls.length > 0,
       unresolvedImports: collected.dynamicCalls
     };
+    usesStorage = usesStorage || codeUsesChromeStorage(entry.code);
+    for (const imported of collected.imports) usesStorage = usesStorage || codeUsesChromeStorage(imported.code);
   }
 
   // ---------------------------------------------------------------------
@@ -513,38 +626,61 @@ export async function parseExtensionDir(extDir) {
   const pageByPath = new Map();
   const binaryByPath = new Map();
 
-  const addCssAsset = (asset, matches, source, runAt = null) => {
+  const addCssAsset = (asset, gates, source, entryRunAt = null, allFrames = false) => {
     if (cssByPath.has(asset.path)) {
       const existing = cssByPath.get(asset.path);
-      existing.matches = mergeGates(existing.matches, matches);
-      existing.runAt = earlierRunAt(existing.runAt, runAt);
+      existing.gates = mergeGateLists(existing.gates, gates);
+      existing.runAt = mergeRunAt(existing.runAt, entryRunAt);
+      existing.allFrames = existing.allFrames || allFrames;
       return;
     }
-    const record = { path: asset.path, content: asset.code, sha256: asset.sha256, matches, source, runAt };
+    const record = {
+      path: asset.path,
+      content: asset.code,
+      sha256: asset.sha256,
+      gates,
+      runAt: entryRunAt || 'document-idle',
+      allFrames,
+      source
+    };
     cssByPath.set(asset.path, record);
     cssAssets.push(record);
   };
 
-  const addPageScript = (asset, matches, source, runAt = null) => {
+  const addPageScript = (asset, gates, source, entryRunAt = null, allFrames = false) => {
     if (pageByPath.has(asset.path)) {
       const existing = pageByPath.get(asset.path);
-      existing.matches = mergeGates(existing.matches, matches);
-      existing.runAt = earlierRunAt(existing.runAt, runAt);
+      existing.gates = mergeGateLists(existing.gates, gates);
+      existing.runAt = mergeRunAt(existing.runAt, entryRunAt);
+      existing.allFrames = existing.allFrames || allFrames;
       return;
     }
-    const record = { path: asset.path, code: asset.code, sha256: asset.sha256, matches, source, runAt };
+    const record = {
+      path: asset.path,
+      code: asset.code,
+      sha256: asset.sha256,
+      gates,
+      runAt: entryRunAt || 'document-idle',
+      allFrames,
+      source
+    };
     pageByPath.set(asset.path, record);
     pageScripts.push(record);
   };
 
-  const addBinaryAsset = async (relativePath, bulkMatches) => {
-    if (binaryByPath.has(relativePath)) {
-      binaryByPath.get(relativePath).matches = mergeGates(binaryByPath.get(relativePath).matches, bulkMatches);
+  const addBinaryAsset = async (relativePath, gates) => {
+    if (binaryByPath.has(relativePath)) return;
+    let realPath;
+    try {
+      const absolute = safeResolve(root, relativePath);
+      realPath = await assertRealInside(root, absolute, relativePath);
+    } catch {
+      warnings.push(`web_accessible_resources file not found: ${relativePath}`);
       return;
     }
     let info;
     try {
-      info = await stat(safeResolve(root, relativePath));
+      info = await stat(realPath);
     } catch {
       warnings.push(`web_accessible_resources file not found: ${relativePath}`);
       return;
@@ -556,7 +692,7 @@ export async function parseExtensionDir(extDir) {
     }
     let buffer;
     try {
-      buffer = await readFile(safeResolve(root, relativePath));
+      buffer = await readFile(realPath);
     } catch {
       warnings.push(`web_accessible_resources file could not be read: ${relativePath}`);
       return;
@@ -566,20 +702,19 @@ export async function parseExtensionDir(extDir) {
       mimeType: mimeTypeForPath(relativePath),
       base64: buffer.toString('base64'),
       size: info.size,
-      matches: bulkMatches,
+      gates,
       dataUri: toDataUri(mimeTypeForPath(relativePath), buffer)
     };
     binaryByPath.set(relativePath, record);
     binaryAssets.push(record);
   };
 
-  // Content-script CSS runs first (matches its entry); web-accessible CSS after.
   for (const entry of contentScripts) {
-    for (const asset of entry.css) addCssAsset(asset, entry.matches, `content_scripts[${entry.index}]`, entry.runAt);
+    for (const asset of entry.css) addCssAsset(asset, [entry.gate], `content_scripts[${entry.index}]`, entry.runAt, entry.allFrames);
+    usesStorage = usesStorage || entry.js.some(asset => codeUsesChromeStorage(asset.code));
   }
 
-  const codeReferencedBy = relativePath =>
-    contentScripts.filter(entry => entry.js.some(js => js.code.includes(relativePath)));
+  const referencedBy = relativePath => contentScripts.filter(entry => entry.js.some(js => js.code.includes(relativePath)));
 
   for (const warEntry of warEntries) {
     const warMatches = [];
@@ -587,12 +722,12 @@ export async function parseExtensionDir(extDir) {
       const normalized = normalizeUserscriptMatch(rawMatch, warnings);
       if (normalized && !warMatches.includes(normalized)) warMatches.push(normalized);
     }
-    const bulkMatches = warMatches.length > 0 ? warMatches : null;
+    const fallbackGates = warMatches.length > 0 ? [makeGate({ matches: warMatches })] : [];
 
     for (const resourcePattern of Array.isArray(warEntry.resources) ? warEntry.resources : []) {
       let files;
       try {
-        files = await expandResourcePattern(root, resourcePattern);
+        files = await expandResourcePattern(root, resourcePattern, warnings);
       } catch (error) {
         warnings.push(error.message);
         continue;
@@ -605,35 +740,35 @@ export async function parseExtensionDir(extDir) {
         const lower = file.toLowerCase();
         if (lower.endsWith('.css')) {
           const asset = await loadTextAsset(root, file, 'web_accessible_resources');
-          const referencers = codeReferencedBy(file);
-          const matches = referencers.length > 0
-            ? [...new Set(referencers.flatMap(entry => entry.matches))]
-            : bulkMatches;
-          const runAt = referencers.length > 0
-            ? referencers.map(entry => entry.runAt).reduce(earlierRunAt)
+          const referencers = referencedBy(file);
+          const gates = referencers.length > 0 ? referencers.map(entry => entry.gate) : fallbackGates;
+          const entryRunAt = referencers.length > 0
+            ? referencers.map(entry => entry.runAt).reduce((left, right) => mergeRunAt(left, right))
             : 'document-idle';
-          addCssAsset(asset, matches, 'web_accessible_resources', runAt);
+          addCssAsset(asset, gates, 'web_accessible_resources', entryRunAt, referencers.some(entry => entry.allFrames));
         } else if (lower.endsWith('.js') || lower.endsWith('.mjs')) {
           const asset = await loadTextAsset(root, file, 'web_accessible_resources');
-          const referencers = codeReferencedBy(file);
-          const matches = referencers.length > 0
-            ? [...new Set(referencers.flatMap(entry => entry.matches))]
-            : bulkMatches;
-          const runAt = referencers.length > 0
-            ? referencers.map(entry => entry.runAt).reduce(earlierRunAt)
+          const referencers = referencedBy(file);
+          const gates = referencers.length > 0 ? referencers.map(entry => entry.gate) : fallbackGates;
+          const entryRunAt = referencers.length > 0
+            ? referencers.map(entry => entry.runAt).reduce((left, right) => mergeRunAt(left, right))
             : 'document-idle';
-          addPageScript(asset, matches, 'web_accessible_resources', runAt);
+          if (referencers.length === 0) {
+            warnings.push(`Page-world script not referenced by any content script; it will still be injected (${file}).`);
+          }
+          addPageScript(asset, gates, 'web_accessible_resources', entryRunAt, referencers.some(entry => entry.allFrames));
         } else {
-          await addBinaryAsset(file, bulkMatches);
+          await addBinaryAsset(file, fallbackGates);
         }
       }
     }
   }
 
-  // MAIN world content scripts execute directly in the page world.
   for (const entry of contentScripts) {
     if (entry.world !== 'MAIN') continue;
-    for (const asset of entry.js) addPageScript(asset, entry.matches, `content_scripts[${entry.index}].world=MAIN`, entry.runAt);
+    for (const asset of entry.js) {
+      addPageScript(asset, [entry.gate], `content_scripts[${entry.index}].world=MAIN`, entry.runAt, entry.allFrames);
+    }
   }
 
   // ---------------------------------------------------------------------
@@ -643,17 +778,18 @@ export async function parseExtensionDir(extDir) {
   let iconPath = null;
   for (const candidate of readIconCandidates(manifest)) {
     try {
-      const buffer = await readFile(safeResolve(root, candidate.path));
+      const absolute = safeResolve(root, candidate.path);
+      const realPath = await assertRealInside(root, absolute, candidate.path);
+      const buffer = await readFile(realPath);
       iconDataUri = toDataUri(mimeTypeForPath(candidate.path), buffer);
       iconPath = candidate.path;
       break;
     } catch {
-      warnings.push(`Icon file not found: ${candidate.path}`);
+      warnings.push(`Icon file not readable: ${candidate.path}`);
     }
   }
 
   const connectDomains = extractConnectDomains(manifest);
-
   const noframes = contentScripts.length > 0 && contentScripts.every(entry => entry.allFrames !== true);
 
   return {
@@ -677,6 +813,7 @@ export async function parseExtensionDir(extDir) {
     pageScripts,
     binaryAssets,
     webAccessibleResources: warEntries,
+    usesStorage,
     warnings
   };
 }

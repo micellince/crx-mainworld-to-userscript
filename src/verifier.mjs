@@ -1,6 +1,12 @@
 import { readFile } from 'node:fs/promises';
 import { Script, createContext, runInContext } from 'node:vm';
-import { parseExtensionDir, sha256, matchesAnyPattern, patternToSampleUrl } from './parser.mjs';
+import {
+  parseExtensionDir,
+  sha256,
+  gatesMatch,
+  patternToSampleUrl
+} from './parser.mjs';
+import { compileUserscript } from './compiler.mjs';
 
 /**
  * Parses the ==UserScript== header block from a .user.js string.
@@ -33,27 +39,110 @@ export function parseEmbeddedAudit(code) {
   return JSON.parse(match[1]);
 }
 
-function hasHash(code, hash) {
-  return typeof hash === 'string' && hash.length > 0 && code.includes(hash);
+/**
+ * Extracts and decodes the embedded payload block from the generated runtime.
+ * This is the byte-level source of truth: verification re-hashes what was
+ * actually embedded instead of trusting declared hashes.
+ */
+export function parseEmbeddedPayloads(code) {
+  const match = /(?:^|\n)[ \t]*var PAYLOADS = JSON\.parse\(("(?:[^"\\]|\\.)*")\);[ \t]*(?:\r?\n|$)/.exec(code);
+  if (!match) return null;
+  const rawJsonString = JSON.parse(match[1]);
+  return JSON.parse(rawJsonString);
 }
 
-function flattenContentScriptPaths(bundle, href) {
-  const paths = [];
-  const entries = (bundle.contentScripts || []).filter(
-    entry => entry.world !== 'MAIN' && matchesAnyPattern(href, entry.matches)
-  );
-  for (const entry of entries) for (const asset of entry.js) paths.push(asset.path);
-  return paths;
+function assetContent(asset, field) {
+  return field === 'content' ? asset.content : asset.code;
+}
+
+function compareAssetSet(actual, expected, field, label, issues) {
+  if (!Array.isArray(actual)) {
+    issues.push(`${label}: missing embedded payloads`);
+    return;
+  }
+  if (actual.length !== expected.length) {
+    issues.push(`${label}: count ${actual.length}/${expected.length}`);
+  }
+  const byPath = new Map(actual.map(asset => [asset.path, asset]));
+  for (const expectedAsset of expected) {
+    const actualAsset = byPath.get(expectedAsset.path);
+    if (!actualAsset) {
+      issues.push(`${label}: missing ${expectedAsset.path}`);
+      continue;
+    }
+    const content = assetContent(actualAsset, field);
+    if (typeof content !== 'string' || sha256(content) !== expectedAsset.sha256) {
+      issues.push(`${label}: hash mismatch ${expectedAsset.path}`);
+    }
+    if (JSON.stringify(actualAsset.gates) !== JSON.stringify(expectedAsset.gates)) {
+      issues.push(`${label}: gate mismatch ${expectedAsset.path}`);
+    }
+    if (actualAsset.runAt !== expectedAsset.runAt) {
+      issues.push(`${label}: runAt mismatch ${expectedAsset.path}`);
+    }
+    if (Boolean(actualAsset.allFrames) !== Boolean(expectedAsset.allFrames)) {
+      issues.push(`${label}: allFrames mismatch ${expectedAsset.path}`);
+    }
+  }
+}
+
+function compareContentScripts(actual, expected, issues) {
+  if (!Array.isArray(actual)) {
+    issues.push('contentScripts: missing embedded payloads');
+    return;
+  }
+  if (actual.length !== expected.length) issues.push(`contentScripts: count ${actual.length}/${expected.length}`);
+  for (const expectedEntry of expected) {
+    const actualEntry = actual.find(entry => entry.index === expectedEntry.index);
+    if (!actualEntry) {
+      issues.push(`contentScripts: missing entry ${expectedEntry.index}`);
+      continue;
+    }
+    if (JSON.stringify(actualEntry.gates) !== JSON.stringify(expectedEntry.gates)) {
+      issues.push(`contentScripts: gate mismatch ${expectedEntry.index}`);
+    }
+    if (actualEntry.runAt !== expectedEntry.runAt) issues.push(`contentScripts: runAt mismatch ${expectedEntry.index}`);
+    if (Boolean(actualEntry.allFrames) !== Boolean(expectedEntry.allFrames)) {
+      issues.push(`contentScripts: allFrames mismatch ${expectedEntry.index}`);
+    }
+    const expectedJs = expectedEntry.js;
+    if (!Array.isArray(actualEntry.js) || actualEntry.js.length !== expectedJs.length) {
+      issues.push(`contentScripts: js count ${expectedEntry.index}`);
+      continue;
+    }
+    for (let index = 0; index < expectedJs.length; index += 1) {
+      if (actualEntry.js[index].path !== expectedJs[index].path || sha256(actualEntry.js[index].code) !== expectedJs[index].sha256) {
+        issues.push(`contentScripts: hash mismatch ${expectedJs[index].path}`);
+      }
+    }
+  }
+}
+
+function expectedIsolatedContentScripts(bundle) {
+  return (bundle.contentScripts || [])
+    .filter(entry => entry.world !== 'MAIN')
+    .map(entry => ({
+      index: entry.index,
+      gates: [entry.gate],
+      runAt: entry.runAt,
+      allFrames: entry.allFrames,
+      js: entry.js.map(asset => ({ path: asset.path, code: asset.code, sha256: asset.sha256 }))
+    }));
 }
 
 function gatedAssets(bundle, href) {
   const css = (bundle.cssAssets || [])
-    .filter(asset => matchesAnyPattern(href, asset.matches))
+    .filter(asset => gatesMatch(href, asset.gates))
     .map(asset => asset.path);
   const pageScripts = (bundle.pageScripts || [])
-    .filter(asset => matchesAnyPattern(href, asset.matches))
+    .filter(asset => gatesMatch(href, asset.gates))
     .map(asset => asset.path);
-  const contentScripts = flattenContentScriptPaths(bundle, href);
+  const contentScripts = [];
+  for (const entry of bundle.contentScripts || []) {
+    if (entry.world === 'MAIN') continue;
+    if (!gatesMatch(href, [entry.gate])) continue;
+    for (const asset of entry.js) contentScripts.push(asset.path);
+  }
   return { css, pageScripts, contentScripts };
 }
 
@@ -65,8 +154,7 @@ function sameStringSet(actual, expected) {
 
 /**
  * Builds a sandbox that emulates just enough of the browser + Tampermonkey
- * environment for a converted userscript to boot generically:
- * DOM, CSS injection, window messaging, timers and GM_xmlhttpRequest.
+ * environment for a converted userscript to boot generically.
  */
 function createSandboxEnvironment(sampleUrl, options) {
   const parsedUrl = new URL(sampleUrl);
@@ -99,6 +187,9 @@ function createSandboxEnvironment(sampleUrl, options) {
       runInContext(source, sandbox, { filename, timeout: 15000 });
     } catch (error) {
       trackError(`script:${filename}`, error);
+      // Re-throw so the generated runtime records a fatal page-script error
+      // instead of silently passing verification.
+      throw error;
     }
   }
 
@@ -137,7 +228,7 @@ function createSandboxEnvironment(sampleUrl, options) {
   function createElement(rawTag) {
     const tagName = String(rawTag || 'div').toUpperCase();
     const listeners = new Map();
-    const element = {
+    return {
       nodeType: 1,
       tagName,
       dataset: {},
@@ -235,7 +326,6 @@ function createSandboxEnvironment(sampleUrl, options) {
         return createElement(tagName);
       }
     };
-    return element;
   }
 
   function walkElements(node, callback) {
@@ -557,7 +647,7 @@ function createSandboxEnvironment(sampleUrl, options) {
 /**
  * Runs a 4-stage automated verification suite on a compiled userscript:
  *  1. metadata_contract     - userscript header vs manifest contract
- *  2. payload_sha256_parity - byte-level hashes of every embedded payload
+ *  2. payload_sha256_parity - re-hash every embedded payload (not declared hashes)
  *  3. vm_syntax_compile     - full userscript syntax compilation
  *  4. sandbox_e2e_smoke_test- generic browser/Tampermonkey sandbox boot test
  */
@@ -577,6 +667,7 @@ export async function verifyUserscript(userscriptCodeOrPath, options = {}) {
 
   const meta = parseUserscriptHeader(code);
   const audit = parseEmbeddedAudit(code);
+  const payloads = parseEmbeddedPayloads(code);
 
   // ========================================================================
   // Stage 1: userscript metadata vs manifest contract
@@ -594,52 +685,100 @@ export async function verifyUserscript(userscriptCodeOrPath, options = {}) {
       const matchesParity = sourceBundle.matches.every(match => meta.match.includes(match));
       const connectParity = sourceBundle.connectDomains.every(domain => meta.connect.includes(domain));
       const runAtParity = meta['run-at'] === sourceBundle.runAt;
-      contractOk = contractOk && versionMatches && matchesParity && connectParity && runAtParity;
-      details += `, versionParity=${versionMatches}, matchesParity=${matchesParity}, connectParity=${connectParity}, runAtParity=${runAtParity}`;
+      const storageGrantsParity = !sourceBundle.usesStorage
+        || (meta.grant.includes('GM_getValue') && meta.grant.includes('GM_setValue'));
+      contractOk = contractOk && versionMatches && matchesParity && connectParity && runAtParity && storageGrantsParity;
+      details += `, versionParity=${versionMatches}, matchesParity=${matchesParity}, connectParity=${connectParity}, runAtParity=${runAtParity}, storageGrants=${storageGrantsParity}`;
     }
     if (missingGrants.length > 0) details += `, missingGrants=${missingGrants.join('|')}`;
     record('metadata_contract', contractOk, details);
   }
 
   // ========================================================================
-  // Stage 2: payload SHA-256 parity against the source extension
+  // Stage 2: embedded payload integrity (recomputed SHA-256, not declarations)
   // ========================================================================
-  if (!audit || !audit.hashes) {
-    record('payload_sha256_parity', false, 'Missing embedded __CRX2USER_AUDIT__ hash block');
+  if (!payloads) {
+    record('payload_sha256_parity', false, 'Missing embedded payload block (artifact from an older generator?)');
   } else if (sourceBundle) {
-    const hashes = audit.hashes;
-    const backgroundOk = !sourceBundle.background
-      || (hashes.background === sourceBundle.background.sha256 && hasHash(code, hashes.background));
-    const importsExpected = sourceBundle.background ? sourceBundle.background.imports || [] : [];
-    const importsOk = importsExpected.every(
-      asset => hashes.backgroundImports?.[asset.path] === asset.sha256 && hasHash(code, asset.sha256)
-    );
-    const cssOk = sourceBundle.cssAssets.every(
-      asset => hashes.cssAssets?.[asset.path] === asset.sha256 && hasHash(code, asset.sha256)
-    );
-    const pageOk = sourceBundle.pageScripts.every(
-      asset => hashes.pageScripts?.[asset.path] === asset.sha256 && hasHash(code, asset.sha256)
-    );
-    const contentScriptAssets = [];
-    for (const entry of sourceBundle.contentScripts) {
-      for (const asset of entry.js) contentScriptAssets.push(asset);
-      for (const asset of entry.css) contentScriptAssets.push(asset);
+    const issues = [];
+    const sourceBackground = sourceBundle.background;
+    if (sourceBackground) {
+      if (typeof payloads.background !== 'string' || sha256(payloads.background) !== sourceBackground.sha256) {
+        issues.push('background hash mismatch');
+      }
+      const expectedImports = sourceBackground.imports || [];
+      const actualImports = Array.isArray(payloads.backgroundImports) ? payloads.backgroundImports : [];
+      if (actualImports.length !== expectedImports.length) issues.push(`imports: count ${actualImports.length}/${expectedImports.length}`);
+      for (const expectedImport of expectedImports) {
+        const actualImport = actualImports.find(asset => asset.path === expectedImport.path);
+        if (!actualImport) {
+          issues.push(`imports: missing ${expectedImport.path}`);
+          continue;
+        }
+        if (sha256(actualImport.code) !== expectedImport.sha256) issues.push(`imports: hash mismatch ${expectedImport.path}`);
+        if (actualImport.specifier !== expectedImport.specifier || actualImport.declaredIn !== expectedImport.declaredIn) {
+          issues.push(`imports: declaration mismatch ${expectedImport.path}`);
+        }
+      }
+    } else if (payloads.background) {
+      issues.push('unexpected background payload');
     }
-    const contentOk = contentScriptAssets.every(
-      asset => hashes.contentScripts?.[asset.path] === asset.sha256 && hasHash(code, asset.sha256)
-    );
-    const allMatch = backgroundOk && importsOk && cssOk && pageOk && contentOk;
+
+    compareAssetSet(payloads.cssAssets, sourceBundle.cssAssets, 'content', 'cssAssets', issues);
+    compareAssetSet(payloads.pageScripts, sourceBundle.pageScripts, 'code', 'pageScripts', issues);
+    compareContentScripts(payloads.contentScripts, expectedIsolatedContentScripts(sourceBundle), issues);
+
+    // Derived payloads (such as the transformed background source with inlined
+    // importScripts) are not covered by source hashes; compare them against a
+    // fresh conversion of the same source extension.
+    const expectedPayloads = compileUserscript(sourceBundle).payloads;
+    if (JSON.stringify(payloads) !== JSON.stringify(expectedPayloads)) {
+      if (payloads.backgroundSource !== expectedPayloads.backgroundSource) {
+        issues.push('backgroundSource does not match a fresh conversion');
+      } else {
+        issues.push('embedded payloads differ from a fresh conversion of the source extension');
+      }
+    }
+
+    const allMatch = issues.length === 0;
     record(
       'payload_sha256_parity',
       allMatch,
-      `background=${backgroundOk}, imports=${importsExpected.length}, css=${sourceBundle.cssAssets.length}, pageScripts=${sourceBundle.pageScripts.length}, contentScripts=${contentScriptAssets.length}`
+      allMatch
+        ? `recomputed: background=${sourceBackground ? 1 : 0}, imports=${sourceBackground ? sourceBackground.imports.length : 0}, css=${sourceBundle.cssAssets.length}, pageScripts=${sourceBundle.pageScripts.length}, contentScripts=${expectedIsolatedContentScripts(sourceBundle).length}`
+        : issues.slice(0, 6).join('; ')
     );
   } else {
-    const hashValues = Object.values(audit.hashes || {})
-      .flatMap(value => (value && typeof value === 'object' ? Object.values(value) : [value]))
-      .filter(value => typeof value === 'string');
-    const hashesEmbedded = hashValues.every(hash => hasHash(code, hash));
-    record('payload_sha256_parity', hashValues.length > 0 && hashesEmbedded, `embedded hashes cannot be matched against a source directory (${hashValues.length} hashes present)`);
+    const declared = audit?.hashes || {};
+    const issues = [];
+    const recomputedBackground = payloads.background ? sha256(payloads.background) : null;
+    if ((declared.background || null) !== recomputedBackground) issues.push('background hash does not match embedded payload');
+    const recomputedBackgroundSource = payloads.backgroundSource ? sha256(payloads.backgroundSource) : null;
+    if ((declared.backgroundSource || null) !== recomputedBackgroundSource) issues.push('backgroundSource hash does not match embedded payload');
+    const recomputedImports = Object.fromEntries((payloads.backgroundImports || []).map(asset => [asset.path, sha256(asset.code)]));
+    for (const [path, hash] of Object.entries(declared.backgroundImports || {})) {
+      if (recomputedImports[path] !== hash) issues.push(`import hash mismatch: ${path}`);
+    }
+    const recomputedCss = Object.fromEntries((payloads.cssAssets || []).map(asset => [asset.path, sha256(asset.content)]));
+    for (const [path, hash] of Object.entries(declared.cssAssets || {})) {
+      if (recomputedCss[path] !== hash) issues.push(`css hash mismatch: ${path}`);
+    }
+    const recomputedPage = Object.fromEntries((payloads.pageScripts || []).map(asset => [asset.path, sha256(asset.code)]));
+    for (const [path, hash] of Object.entries(declared.pageScripts || {})) {
+      if (recomputedPage[path] !== hash) issues.push(`page script hash mismatch: ${path}`);
+    }
+    const recomputedContent = {};
+    for (const entry of payloads.contentScripts || []) {
+      for (const asset of entry.js || []) recomputedContent[asset.path] = sha256(asset.code);
+    }
+    for (const [path, hash] of Object.entries(declared.contentScripts || {})) {
+      if (recomputedContent[path] !== hash) issues.push(`content script hash mismatch: ${path}`);
+    }
+    record(
+      'payload_sha256_parity',
+      issues.length === 0,
+      issues.length === 0 ? 'recomputed embedded payload hashes match the artifact audit block' : issues.slice(0, 6).join('; ')
+    );
   }
 
   // ========================================================================
@@ -697,6 +836,7 @@ export async function verifyUserscript(userscriptCodeOrPath, options = {}) {
       const pageScriptsOk = sameStringSet(stats.pageScripts, expected.pageScripts);
       const contentScriptErrors = (stats.errors || []).filter(message => message.startsWith('contentScript:'));
       const pageScriptErrors = (stats.errors || []).filter(message => message.startsWith('pageScript:'));
+      const backgroundErrors = (stats.errors || []).filter(message => message.startsWith('background'));
 
       let bridgeProbe = null;
       if (report.chrome && sourceBundle && sourceBundle.background && Number(stats.backgroundListeners) > 0) {
@@ -710,7 +850,9 @@ export async function verifyUserscript(userscriptCodeOrPath, options = {}) {
       }
       const bridgeOk = bridgeProbe === null || bridgeProbe > 0;
 
-      const allOk = bootOk && backgroundOk && cssOk && contentScriptsOk && pageScriptsOk && bridgeOk && contentScriptErrors.length === 0;
+      const allOk = bootOk && backgroundOk && cssOk && contentScriptsOk && pageScriptsOk && bridgeOk
+        && contentScriptErrors.length === 0 && pageScriptErrors.length === 0;
+
       const details = [
         `boot=${bootOk}`,
         `background=${backgroundOk ? 'started' : 'failed'}`,
@@ -722,10 +864,11 @@ export async function verifyUserscript(userscriptCodeOrPath, options = {}) {
         `errors=${contentScriptErrors.length + pageScriptErrors.length}`
       ];
       if (contentScriptErrors.length > 0) details.push(`contentScriptErrors=${contentScriptErrors.slice(0, 3).join(' | ')}`);
-      if (pageScriptErrors.length > 0) details.push(`pageScriptWarnings=${pageScriptErrors.slice(0, 2).join(' | ')}`);
+      if (pageScriptErrors.length > 0) details.push(`pageScriptErrors=${pageScriptErrors.slice(0, 3).join(' | ')}`);
+      if (backgroundErrors.length > 0) details.push(`backgroundErrors=${backgroundErrors.slice(0, 3).join(' | ')}`);
       if (!allOk) {
         details.push(
-          `flags=boot:${bootOk},background:${backgroundOk},css:${cssOk},contentScripts:${contentScriptsOk},pageScripts:${pageScriptsOk},bridge:${bridgeOk},contentScriptErrors:${contentScriptErrors.length}`
+          `flags=boot:${bootOk},background:${backgroundOk},css:${cssOk},contentScripts:${contentScriptsOk},pageScripts:${pageScriptsOk},bridge:${bridgeOk}`
         );
       }
       record('sandbox_e2e_smoke_test', allOk, details.join(', '));
