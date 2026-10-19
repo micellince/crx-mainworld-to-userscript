@@ -1,0 +1,46 @@
+{
+  "manifest_version": 3,
+  "name": "Generic Companion Extension",
+  "short_name": "GenericCompanion",
+  "version": "2.4.1",
+  "description": "Generic MV3 fixture: recursive importScripts, multiple content script groups, MAIN world script, content CSS.",
+  "homepage_url": "https://generic.example.com",
+  "icons": {
+    "16": "icon16.png",
+    "32": "icon16.png"
+  },
+  "host_permissions": [
+    "https://api.example.com/*",
+    "https://*.data.example.net/*",
+    "http://localhost:3000/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "matches": ["https://app.example.com/*"],
+      "js": ["content/bridge.js"],
+      "css": ["content/theme.css"],
+      "run_at": "document_idle"
+    },
+    {
+      "matches": ["https://docs.example.com/*"],
+      "js": ["content/docs.js"],
+      "run_at": "document_start"
+    },
+    {
+      "matches": ["https://app.example.com/*"],
+      "js": ["page/main-world.js"],
+      "world": "MAIN",
+      "run_at": "document_idle",
+      "all_frames": true
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["page/main.js", "page/main.css", "assets/logo.png"],
+      "matches": ["https://app.example.com/*"]
+    }
+  ]
+}
