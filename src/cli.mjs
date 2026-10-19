@@ -28,6 +28,10 @@ Options:
       --json               Print the result as machine-readable JSON
   -h, --help               Show this help
 
+Security:
+  Verification boots the converted userscript inside a Node.js VM sandbox.
+  node:vm is NOT a security boundary — only convert/verify extensions you trust.
+
 Examples:
   crx2user convert ./unpacked-extension -o dist/companion.user.js --verify
   crx2user verify dist/companion.user.js --source ./unpacked-extension
