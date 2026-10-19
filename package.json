@@ -1,0 +1,31 @@
+{
+  "name": "crx-mainworld-to-userscript",
+  "version": "1.0.0",
+  "description": "Zero-dependency CLI & library to convert Manifest V3 Chrome Extensions (Page-World / MAIN world + Background CORS Bridge) into standalone Tampermonkey/Violentmonkey Userscripts with automated sandbox E2E verification.",
+  "license": "MIT",
+  "type": "module",
+  "bin": {
+    "crx2user": "./src/cli.mjs",
+    "crx-to-userscript": "./src/cli.mjs"
+  },
+  "main": "./src/index.mjs",
+  "exports": {
+    ".": "./src/index.mjs"
+  },
+  "scripts": {
+    "build:futmarket": "node src/cli.mjs convert ../backups/v0.16.5/fc27-enhancer-ext -o dist/futmarket-app-v0.16.5.user.js --update-url https://futmarket.app/releases/futmarket-app.user.js --download-url https://futmarket.app/releases/futmarket-app.user.js --verify",
+    "verify:futmarket": "node src/cli.mjs verify dist/futmarket-app-v0.16.5.user.js --source ../backups/v0.16.5/fc27-enhancer-ext",
+    "test": "node --test tests/*.test.mjs"
+  },
+  "keywords": [
+    "chrome-extension",
+    "manifest-v3",
+    "userscript",
+    "tampermonkey",
+    "violentmonkey",
+    "greasemonkey",
+    "converter",
+    "main-world",
+    "cors-bridge"
+  ]
+}

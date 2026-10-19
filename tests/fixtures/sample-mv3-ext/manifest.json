@@ -1,0 +1,31 @@
+{
+  "manifest_version": 3,
+  "name": "Sample MainWorld Companion",
+  "short_name": "SampleCompanion",
+  "version": "1.0.0",
+  "homepage_url": "https://example.com",
+  "description": "Sample MV3 extension using Page-World injection and Background CORS fetch bridge.",
+  "host_permissions": [
+    "https://enhancer-api.futnext.com/*",
+    "https://www.futbin.org/*"
+  ],
+  "background": {
+    "service_worker": "background.js"
+  },
+  "content_scripts": [
+    {
+      "js": ["contentscript.js"],
+      "matches": [
+        "https://www.ea.com/ea-sports-fc/ultimate-team/web-app/*",
+        "https://www.ea.com/*/ea-sports-fc/ultimate-team/web-app/*"
+      ],
+      "run_at": "document_idle"
+    }
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["assets/index.css", "js/main.js"],
+      "matches": ["https://www.ea.com/*"]
+    }
+  ]
+}
